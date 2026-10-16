@@ -33,7 +33,12 @@ implementation.
 - Purpose: render prompts to OpenAI messages and return text, Pydantic
   structured output, or streamed text deltas.
 - Important methods: `chat_completion`, `batch_chat_completion`,
-  `stream_chat_completion`.
+  `stream_chat_completion`, `option_probabilities`.
+- `option_probabilities(conversation, options, top_logprobs=20, logit_bias=None,
+  extra_body=None)` requests one greedy token with logprobs and returns the
+  first-token probability mass of each option (`"Y"` and `" Y"` are summed;
+  values are not renormalized). It is the backend of single-token decision
+  models, see [`ragu/decision/README.md`](../decision/README.md).
 - Important parameters: `client` (`CachedAsyncOpenAI`), `model_name`.
 
 ```python

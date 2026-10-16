@@ -216,7 +216,29 @@ class LLM(ABC):
         if False:
             yield ""
         raise NotImplementedError(f"{type(self).__name__} does not support streaming chat completion")
-        
+
+    async def option_probabilities(
+        self,
+        conversation: list[ChatCompletionMessageParam],
+        options: list[str],
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """
+        Return the first-token probability mass of each option.
+
+        Used by single-token decision models (:mod:`ragu.decision`). The
+        default implementation raises; backends that expose logprobs
+        override it.
+
+        :param conversation: OpenAI-format conversation messages.
+        :param options: Option labels (single tokens).
+        :param kwargs: Backend-specific options (``top_logprobs``,
+            ``logit_bias``, ``extra_body``).
+        :returns: Mapping ``option -> probability mass`` in ``[0, 1]``;
+            values are not renormalized.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support option probabilities")
+
 
 
 class LLMOpenAI(LLM):
@@ -312,3 +334,29 @@ class LLMOpenAI(LLM):
             **(self.kwargs | kwargs),
         ):
             yield chunk
+
+    @override
+    async def option_probabilities(
+        self,
+        conversation: list[ChatCompletionMessageParam],
+        options: list[str],
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """
+        Forward an option-probabilities request.
+
+        Constructor kwargs are not merged here: they hold generation options
+        such as ``temperature``, while option scoring always decodes a single
+        greedy token.
+
+        :param conversation: OpenAI-format conversation messages.
+        :param options: Option labels (single tokens).
+        :param kwargs: Forwarded to :meth:`CachedAsyncOpenAI.option_probabilities`.
+        :returns: Mapping ``option -> probability mass`` in ``[0, 1]``.
+        """
+        return await self.client.option_probabilities(
+            model_name=self.model_name,
+            conversation=conversation,
+            options=options,
+            **kwargs,
+        )

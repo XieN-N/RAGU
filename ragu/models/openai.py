@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 from collections.abc import AsyncIterator, MutableMapping, Sequence
 from dataclasses import dataclass
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
@@ -148,6 +149,7 @@ class CachedAsyncOpenAI(ResponseCachingMixin):
         self._uncached_raw_embed_text = self._uncached_embed_text
         self._uncached_raw_embed_texts = self._uncached_embed_texts
         self._uncached_raw_score = self._uncached_score
+        self._uncached_raw_option_probabilities = self._uncached_option_probabilities
 
         # saving errors to debug
         # Per-instance `debug_errors_storage` overrides `Settings.debug_errors_path`; both default to None.
@@ -171,6 +173,8 @@ class CachedAsyncOpenAI(ResponseCachingMixin):
                 self._uncached_embed_texts, self.debug_errors_storage)
             self._uncached_score = save_args_on_exception(
                 self._uncached_score, self.debug_errors_storage)
+            self._uncached_option_probabilities = save_args_on_exception(
+                self._uncached_option_probabilities, self.debug_errors_storage)
 
         # Handlers/wrappers will be called in this order:
         # 1. Caching
@@ -195,6 +199,8 @@ class CachedAsyncOpenAI(ResponseCachingMixin):
                 self._uncached_embed_texts, *contexts)
             self._uncached_score = attach_async_contexts(
                 self._uncached_score, *contexts)
+            self._uncached_option_probabilities = attach_async_contexts(
+                self._uncached_option_probabilities, *contexts)
 
         # add retrying decorators
         if retry_times_sec:
@@ -211,7 +217,9 @@ class CachedAsyncOpenAI(ResponseCachingMixin):
             self._uncached_embed_text = retrying_decorator(self._uncached_embed_text)
             self._uncached_embed_texts = retrying_decorator(self._uncached_embed_texts)
             self._uncached_score = retrying_decorator(self._uncached_score)
-    
+            self._uncached_option_probabilities = retrying_decorator(
+                self._uncached_option_probabilities)
+
     @overload
     async def chat_completion(
         self,
@@ -375,6 +383,41 @@ class CachedAsyncOpenAI(ResponseCachingMixin):
             model_name=model_name,
             text_1=text_1,
             text_2=text_2,
+            **kwargs,
+        )
+
+    async def option_probabilities(
+        self,
+        model_name: str,
+        conversation: list[ChatCompletionMessageParam],
+        options: list[str],
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """
+        Returns the first-token probability mass of each option, with caching.
+
+        Asks for exactly one output token with ``logprobs`` and sums the
+        probabilities of the ``top_logprobs`` alternatives whose text,
+        stripped of whitespace, equals an option (so ``"Y"`` and ``" Y"``
+        count together). The masses are not renormalized: options absent
+        from ``top_logprobs`` get ``0.0`` and the values may sum to less
+        than 1. Requires a backend that returns logprobs (OpenAI, vLLM);
+        reasoning models that spend the first token on a reasoning channel
+        are not supported.
+
+        :param model_name: Provider model name.
+        :param conversation: OpenAI-format chat messages.
+        :param options: Option labels; each should be a single token.
+        :param kwargs: Supported options: ``top_logprobs`` (default 20),
+            ``logit_bias`` (``{token_id: bias}``, string keys are fine) and
+            ``extra_body`` (backend-specific fields such as vLLM's
+            ``allowed_token_ids``).
+        :returns: Mapping ``option -> probability mass`` in ``[0, 1]``.
+        """
+        return await self._cached_option_probabilities(
+            model_name=model_name,
+            conversation=conversation,
+            options=options,
             **kwargs,
         )
 
@@ -571,3 +614,65 @@ class CachedAsyncOpenAI(ResponseCachingMixin):
         results.sort(key=lambda x: x[1], reverse=True)
 
         return results
+
+    @override
+    async def _uncached_option_probabilities(
+        self,
+        model_name: str,
+        conversation: list[ChatCompletionMessageParam],
+        options: list[str],
+        top_logprobs: int = 20,
+        logit_bias: dict[str, int] | dict[int, int] | None = None,
+        extra_body: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """
+        Performs uncached single-token logprobs call.
+
+        :param model_name: Provider model name.
+        :param conversation: OpenAI-format chat messages.
+        :param options: Option labels to collect probability mass for.
+        :param top_logprobs: Number of first-token alternatives to request.
+        :param logit_bias: Optional ``{token_id: bias}`` mapping.
+        :param extra_body: Optional backend-specific request fields.
+        :param kwargs: Unsupported; raises ``TypeError`` if not empty.
+        :returns: Mapping ``option -> probability mass`` in ``[0, 1]``.
+        :raises ValueError: If the backend returned no logprobs.
+        """
+        logger.debug(f'Sending option_probabilities API request with {len(options)} options...')
+        if kwargs:
+            raise TypeError(
+                f'Unsupported option_probabilities arguments: {sorted(kwargs)}. '
+                f'Supported extra arguments: top_logprobs, logit_bias, extra_body.'
+            )
+        response = await self.client.chat.completions.create(
+            model=model_name,
+            messages=conversation,
+            max_completion_tokens=1,
+            temperature=0.0,
+            logprobs=True,
+            top_logprobs=top_logprobs,
+            logit_bias=(
+                {str(token_id): bias for token_id, bias in logit_bias.items()}
+                if logit_bias else omit
+            ),
+            extra_body=extra_body,
+        )
+
+        choice_logprobs = response.choices[0].logprobs
+        if choice_logprobs is None or not choice_logprobs.content:
+            raise ValueError(
+                f'Model {model_name!r} returned no logprobs; option scoring '
+                f'needs a backend that supports logprobs/top_logprobs.'
+            )
+        first = choice_logprobs.content[0]
+        alternatives = [(alt.token, alt.logprob) for alt in first.top_logprobs]
+        if not alternatives:
+            alternatives = [(first.token, first.logprob)]
+
+        masses = {option: 0.0 for option in options}
+        for token, logprob in alternatives:
+            key = token.strip()
+            if key in masses:
+                masses[key] += math.exp(logprob)
+        return {option: min(mass, 1.0) for option, mass in masses.items()}

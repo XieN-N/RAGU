@@ -25,6 +25,8 @@ class ResponseCachingMixin:
       and `_uncached_chat_completion` (abstract)
     - `_cached_embed_text` (wrapper)
       and `_uncached_embed_text` (abstract)
+    - `_cached_option_probabilities` (wrapper)
+      and `_uncached_option_probabilities` (abstract)
 
     ### How caching works
 
@@ -113,6 +115,63 @@ class ResponseCachingMixin:
         **kwargs: Any,
     ) -> Any:
         """Abstract method to cache.
+
+        kwargs are here to add custom arguments that will also be cached
+        """
+        raise NotImplementedError
+
+    async def _cached_option_probabilities(
+        self,
+        model_name: str,
+        conversation: list[ChatCompletionMessageParam],
+        options: list[str],
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """Caching wrapper for _uncached_option_probabilities"""
+        if self.cache is None:
+            return await self._uncached_option_probabilities(
+                model_name=model_name,
+                conversation=conversation,
+                options=options,
+                **kwargs,
+            )
+
+        args: dict[str, Any] = {
+            'cache_prefix': self.cache_prefix,
+            'model_name': model_name,
+            'method': 'option_probabilities',
+            'conversation': conversation,
+            'options': options,
+            'kwargs': kwargs,
+        }
+        key = json.dumps(args, sort_keys=True)
+
+        if value := self.cache.get(key, None):
+            logger.debug(f'Cache hit for {model_name}!')
+            cached: dict[str, float]
+            _args, cached = value
+            return dict(cached)
+
+        response = await self._uncached_option_probabilities(
+            model_name=model_name,
+            conversation=conversation,
+            options=options,
+            **kwargs,
+        )
+
+        self.cache[key] = args, response
+
+        return response
+
+    async def _uncached_option_probabilities(
+        self,
+        model_name: str,
+        conversation: list[ChatCompletionMessageParam],
+        options: list[str],
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """
+        Abstract method to cache.
 
         kwargs are here to add custom arguments that will also be cached
         """

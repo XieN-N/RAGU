@@ -135,6 +135,16 @@ class OpenAIMockServer(http.server.ThreadingHTTPServer):
     _active: bool                    # False → 503 + Connection: close
     _exception_code: int | None      # not None → return this HTTP error code instead of 200
     _broken_schema: bool             # True → return "." instead of proper JSON body
+    # (token, logprob) pairs returned as top_logprobs when a request asks for logprobs
+    _top_logprobs: list[tuple[str, float]]
+    last_chat_body: dict[str, Any] | None  # body of the latest /chat/completions request
+
+    #: Default first-token alternatives: covers Y/N relevance and A/B/.../Z choices;
+    #: the probabilities sum to less than 1, as in a real top-k slice.
+    DEFAULT_TOP_LOGPROBS: tuple[tuple[str, float], ...] = (
+        ('Y', -0.5), ('A', -1.5), (' Y', -3.0), ('N', -3.2),
+        ('B', -4.0), ('C', -4.5), ('Z', -5.0),
+    )
 
     def __init__(
         self,
@@ -152,6 +162,8 @@ class OpenAIMockServer(http.server.ThreadingHTTPServer):
         self._active = True
         self._exception_code = None
         self._broken_schema = False
+        self._top_logprobs = list(self.DEFAULT_TOP_LOGPROBS)
+        self.last_chat_body = None
         self._timers = []
 
     @property
@@ -254,11 +266,42 @@ class OpenAIMockServer(http.server.ThreadingHTTPServer):
         t1.start()
         t2.start()
 
+    # -- logprobs ---------------------------------------------------------
+
+    def set_top_logprobs(self, top_logprobs: list[tuple[str, float]]) -> None:
+        """Set the (token, logprob) alternatives returned for logprobs requests; the first one is the emitted token."""
+        with self._lock:
+            self._top_logprobs = list(top_logprobs)
+
+    def _logprobs_payload(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Return a ChoiceLogprobs dict truncated to body['top_logprobs'], or None if logprobs were not requested."""
+        if not body.get('logprobs'):
+            return None
+        with self._lock:
+            alternatives = list(self._top_logprobs)
+        limit = body.get('top_logprobs')
+        if isinstance(limit, int):
+            alternatives = alternatives[:limit]
+        if not alternatives:
+            alternatives = [('str', 0.0)]
+        token, logprob = alternatives[0]
+        return {'content': [{
+            'token': token,
+            'logprob': logprob,
+            'bytes': list(token.encode()),
+            'top_logprobs': [
+                {'token': t, 'logprob': lp, 'bytes': list(t.encode())}
+                for t, lp in alternatives
+            ],
+        }]}
+
     # -- endpoint handlers -------------------------------------------------
 
     def _handle_chat_completions(self, body: dict[str, Any]) -> dict[str, Any]:
         """Return a ChatCompletion dict: 'str' content for plain text, JSON-encoded schema sample
         for response_format requests, or a tool_call message for tool-mode requests."""
+        with self._lock:
+            self.last_chat_body = body
         tools = cast(list[dict[str, Any]], body['tools']) if body.get('tools') else None
         response_format = cast(dict[str, Any], body['response_format']) if body.get('response_format') else None
 
@@ -292,12 +335,20 @@ class OpenAIMockServer(http.server.ThreadingHTTPServer):
             message = {'role': 'assistant', 'content': 'str'}
             finish_reason = 'stop'
 
+        choice: dict[str, Any] = {'index': 0, 'message': message, 'finish_reason': finish_reason}
+        logprobs = self._logprobs_payload(body)
+        if logprobs is not None:
+            # single-token decision path: the emitted token is the top alternative
+            message['content'] = cast(list[dict[str, Any]], logprobs['content'])[0]['token']
+            choice['logprobs'] = logprobs
+            choice['finish_reason'] = 'length'
+
         return {
             'id': 'chatcmpl-mock',
             'object': 'chat.completion',
             'created': 0,
             'model': cast(str, body.get('model', 'mock')),
-            'choices': [{'index': 0, 'message': message, 'finish_reason': finish_reason}],
+            'choices': [choice],
             'usage': {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
         }
 

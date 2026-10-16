@@ -389,6 +389,13 @@ Context selection in `LocalSearchEngine` (`LocalParams.selector`, default `"none
   relevance question per pooled candidate; candidates with `P(Y) >= select_threshold`
   (default `0.5`) are kept, topped up to `select_floor` (default `3`) per section
   in pool order. One request per candidate.
+- `select_hops` (pointwise only, default `1`): with `n > 1` the selection walks
+  `n - 1` more hops. The unvisited endpoints of relations that passed on the
+  previous hop form the frontier; their entities, relations and chunks are pooled
+  by cosine similarity to the query plus the facts kept so far, judged with those
+  facts as `state_context`, and the passing ones are added to the context. A hop
+  with no passing relation ends the walk; per-hop statistics go to
+  `retrieve.metrics["selection_hops"]`.
 - `selector="cosine"`: no model calls; keeps the `select_top_entities` /
   `select_top_relations` / `select_top_chunks` (defaults 4 / 4 / 3) first
   candidates of each pool. A ranking baseline for `pointwise`.

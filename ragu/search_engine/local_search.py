@@ -67,6 +67,15 @@ class LocalParams(EngineParams):
     :param select_top_entities: Entities kept by the ``"cosine"`` selector.
     :param select_top_relations: Relations kept by the ``"cosine"`` selector.
     :param select_top_chunks: Chunks kept by the ``"cosine"`` selector.
+    :param select_hops: ``"pointwise"`` only. ``1`` judges the seed
+        neighbourhood. With ``n > 1`` the selection walks ``n - 1`` more hops:
+        the unvisited endpoints of relations that passed on the previous hop
+        become the frontier; their entities, relations and chunks are pooled by
+        cosine similarity to the query plus the facts kept so far, and judged
+        with those facts as ``state_context``. A hop with no passing relation
+        ends the walk. The floor applies to the seed hop only.
+    :param select_state_max_chars: Maximum length of the kept-facts text used as
+        ``state_context`` and in the hop query vector.
     :param select_pool_entities: Entities judged by the selector, in retrieval
         order; the rest are dropped.
     :param select_pool_relations: Relations judged by the selector, taken in
@@ -90,6 +99,8 @@ class LocalParams(EngineParams):
     select_top_entities: int = 4
     select_top_relations: int = 4
     select_top_chunks: int = 3
+    select_hops: int = 1
+    select_state_max_chars: int = 2000
 
 
 @dataclass(slots=True)
@@ -349,6 +360,11 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
         """
         assert self.decision_model is not None
         result = retrieve.result
+        seen_ids = (
+            {e.id for e in result.entities}
+            | {r.id for r in result.relations}
+            | {c.id for c in result.chunks}
+        )
         pools = await self._selection_pools(query_point, result, params)
         entity_out, relation_out, chunk_out = await asyncio.gather(
             self.decision_model.a_score_pointwise(
@@ -379,6 +395,119 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
                 ("chunks", chunk_out, result.chunks),
             )
         }
+        if params.select_hops > 1:
+            await self._select_further_hops(
+                query, retrieve, params, list(relation_out.selected), seen_ids,
+            )
+
+    async def _select_further_hops(
+        self,
+        query: str,
+        retrieve: LocalSearchRetrieve,
+        params: LocalParams,
+        passed_relations: List[Relation],
+        seen_ids: set[str],
+    ) -> None:
+        """
+        Walk ``params.select_hops - 1`` hops beyond the seeds, guided by the decision model.
+
+        The frontier of each hop is the unvisited endpoints of the relations that
+        passed on the previous hop. Its entities, incident relations and source
+        chunks (all unseen so far) are pooled by cosine similarity to the query
+        plus the kept facts and judged with those facts as ``state_context``.
+        Passing items are appended to ``retrieve.result``; per-hop statistics go to
+        ``retrieve.metrics["selection_hops"]``.
+
+        :param query: Input query string.
+        :param retrieve: Context after the seed-hop selection, extended in place.
+        :param params: Selection parameters.
+        :param passed_relations: Seed-hop relations that passed the threshold.
+        :param seen_ids: Ids of every entity, relation and chunk already assembled.
+        """
+        assert self.decision_model is not None
+        result = retrieve.result
+        index = self.knowledge_graph.index
+        visited_entities = {e.id for e in result.entities} | {
+            e_id for e_id in seen_ids if e_id.startswith("ent-")
+        }
+        hop_stats: List[Dict[str, Any]] = []
+
+        for hop in range(1, params.select_hops):
+            frontier_ids = sorted(
+                {x for r in passed_relations for x in (r.subject_id, r.object_id)} - visited_entities
+            )
+            if not frontier_ids:
+                break
+            visited_entities.update(frontier_ids)
+            frontier = [e for e in await index.get_nodes(frontier_ids) if e is not None]
+
+            edge_lists = await index.graph_backend.get_all_edges_for_nodes([e.id for e in frontier])
+            relations: Dict[str, Relation] = {}
+            for edges in edge_lists:
+                for edge in edges:
+                    if edge is not None and edge.id not in seen_ids:
+                        relations[edge.id] = edge
+            chunk_ids = sorted(
+                {c_id for e in frontier for c_id in e.source_chunk_id} - seen_ids
+            )
+            payloads = await index.chunks_kv_storage.get_by_ids(chunk_ids) if chunk_ids else []
+            chunks = [Chunk(**payload) for payload in payloads if payload is not None]
+            entities = [e for e in frontier if e.id not in seen_ids]
+            seen_ids.update(relations)
+            seen_ids.update(c.id for c in chunks)
+            seen_ids.update(e.id for e in entities)
+
+            state = _state_text(result, params.select_state_max_chars)
+            [state_point] = await self.retriever.build_query_vectors([f"{query}\n{state}"])
+            ordered_entities, ordered_relations, ordered_chunks = await asyncio.gather(
+                _order_by_query_similarity(state_point, entities, index.nodes_vector_db),
+                _order_by_query_similarity(state_point, list(relations.values()), index.edges_vector_db),
+                _order_by_query_similarity(state_point, chunks, index.chunks_vector_db),
+            )
+            pools: Dict[str, List[Any]] = {
+                "entities": ordered_entities[:params.select_pool_entities],
+                "relations": ordered_relations[:params.select_pool_relations],
+                "chunks": ordered_chunks[:params.select_pool_chunks],
+            }
+            entity_out, relation_out, chunk_out = await asyncio.gather(
+                self.decision_model.a_score_pointwise(
+                    query, pools["entities"], _format_entity, state_context=state,
+                    threshold=params.select_threshold,
+                ),
+                self.decision_model.a_score_pointwise(
+                    query, pools["relations"], _format_relation, state_context=state,
+                    threshold=params.select_threshold,
+                ),
+                self.decision_model.a_score_pointwise(
+                    query, pools["chunks"], _format_chunk, state_context=state,
+                    threshold=params.select_threshold,
+                ),
+            )
+            result.entities.extend(entity_out.selected)
+            result.relations.extend(relation_out.selected)
+            result.chunks.extend(chunk_out.selected)
+            hop_stats.append({
+                "hop": hop,
+                "frontier": len(frontier),
+                **{
+                    name: {
+                        "candidates": total,
+                        "pool": len(pools[name]),
+                        "passed": len(output.selected),
+                        "n_calls": output.n_calls,
+                        "degraded": output.degraded_count,
+                    }
+                    for name, output, total in (
+                        ("entities", entity_out, len(entities)),
+                        ("relations", relation_out, len(relations)),
+                        ("chunks", chunk_out, len(chunks)),
+                    )
+                },
+            })
+            passed_relations = list(relation_out.selected)
+            if not passed_relations:
+                break
+        retrieve.metrics["selection_hops"] = hop_stats
 
     async def _rank_entities(
         self,
@@ -625,6 +754,19 @@ def _format_relation(relation: Relation) -> str:
 
 def _format_chunk(chunk: Chunk) -> str:
     return chunk.content
+
+
+def _state_text(result: LocalSearchResult, max_chars: int) -> str:
+    """
+    Facts kept so far, as decision-model state: relations first, then entities.
+
+    :param result: Current local context.
+    :param max_chars: Maximum length of the returned text.
+    :return: Newline-separated facts, cut to ``max_chars``.
+    """
+    lines = [_format_relation(r) for r in result.relations]
+    lines += [_format_entity(e) for e in result.entities]
+    return "\n".join(lines)[:max_chars]
 
 
 async def _order_by_query_similarity(

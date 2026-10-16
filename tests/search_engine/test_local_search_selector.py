@@ -138,6 +138,51 @@ async def test_cosine_selector_keeps_top_n_without_decision_model(real_kg, kg_fi
     assert all(section["n_calls"] == 0 for section in selected.metrics["selection"].values())
 
 
+async def _single_seed_engine(real_kg, decision_model):
+    """Engine seeded with one endpoint of a fixture relation; returns (engine, relation, other endpoint)."""
+    edges = await real_kg.index.graph_backend.get_all_edges()
+    if not edges:
+        pytest.skip("fixture graph has no relations")
+    relation = edges[0]
+    seed, frontier_entity = await real_kg.index.get_nodes([relation.subject_id, relation.object_id])
+    engine = LocalSearchEngine(
+        llm=SimpleNamespace(chat_completion=AsyncMock()),
+        knowledge_graph=real_kg,
+        embedder=SimpleNamespace(embed_text=AsyncMock(return_value=[0.0] * 3)),
+        decision_model=decision_model,
+    )
+    engine.retriever.query_entities = AsyncMock(return_value=[([seed], [EmbeddingHit(id=seed.id, distance=1.0)])])
+    engine.retriever.build_query_vectors = AsyncMock(
+        return_value=[Point(dense_embedding=np.ones(3072, dtype=np.float32))]
+    )
+    return engine, relation, frontier_entity
+
+
+async def test_hops_expand_only_from_passed_relations(real_kg) -> None:
+    _, relation, frontier_entity = await _single_seed_engine(real_kg, None)
+    decision_model = KeywordDecisionModel([relation.description])
+    engine, _, _ = await _single_seed_engine(real_kg, decision_model)
+    selected = await engine.search("query", LocalParams(selector="pointwise", select_hops=2, select_floor=0))
+
+    hops = selected.metrics["selection_hops"]
+    assert hops and hops[0]["hop"] == 1 and hops[0]["frontier"] >= 1
+    # the frontier entity was judged on hop 1 with the kept facts as state
+    assert any(text.startswith(f"{frontier_entity.entity_name} (") for text in decision_model.judged)
+    assert relation.id in {r.id for r in selected.result.relations}
+
+
+async def test_hops_stop_when_nothing_passes(real_kg, kg_fixture_ids) -> None:
+    engine = await _engine_with_seeds(real_kg, kg_fixture_ids, KeywordDecisionModel([]))
+    selected = await engine.search("query", LocalParams(selector="pointwise", select_hops=3))
+    assert selected.metrics["selection_hops"] == []
+
+
+async def test_single_hop_reports_no_hop_metrics(real_kg, kg_fixture_ids) -> None:
+    engine = await _engine_with_seeds(real_kg, kg_fixture_ids, KeywordDecisionModel([]))
+    selected = await engine.search("query", LocalParams(selector="pointwise"))
+    assert "selection_hops" not in selected.metrics
+
+
 async def test_selector_without_decision_model_raises(real_kg, kg_fixture_ids) -> None:
     engine = await _engine_with_seeds(real_kg, kg_fixture_ids, None)
     with pytest.raises(ValueError, match="decision_model"):

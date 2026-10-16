@@ -439,6 +439,32 @@ for subquery in subqueries:
 # q2 Из какой страны был автор? ['q1']
 ```
 
+### Decision Model
+
+Decision model отвечает на закрытый вопрос ровно одним выходным токеном и
+берёт распределение ответа из `top_logprobs` этого токена. Это дешёвый способ
+отобрать релевантные рёбра графа, чанки или комьюнити либо выбрать маршрут
+запроса без разбора сгенерированного текста. Можно использовать тот же `LLM`,
+что генерирует ответы, или отдельный (например, локальную модель в vLLM для
+решений и модель по API для ответов).
+
+```python
+from ragu import DecisionModel
+
+decision_model = DecisionModel(llm)
+
+output = await decision_model.a_score_pointwise(
+    query="Кто написал роман 'Камо Грядеши'?",
+    candidates=chunks,
+    format_fn=lambda chunk: chunk.content,
+)
+print([candidate.probability for candidate in output.scored])
+```
+
+Методы, параметры и особенности бэкендов (`logit_bias` в OpenAI,
+`allowed_token_ids` в vLLM) описаны в
+[`../../ragu/decision/README.md`](../../ragu/decision/README.md).
+
 ---
 
 ### Prompt tuning

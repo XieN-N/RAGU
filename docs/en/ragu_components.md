@@ -443,6 +443,31 @@ for subquery in subqueries:
 # q2 What country was the author from? ['q1']
 ```
 
+### Decision Model
+
+A decision model answers a closed question with a single output token and reads
+the answer distribution from that token's `top_logprobs`. It is a cheap way to
+select relevant graph edges, chunks or communities, or to route a query, without
+parsing generated text. It can reuse the answering `LLM` or use a separate one
+(for example a local vLLM model for decisions and an API model for answers).
+
+```python
+from ragu import DecisionModel
+
+decision_model = DecisionModel(llm)
+
+output = await decision_model.a_score_pointwise(
+    query="Who wrote the novel 'Quo Vadis'?",
+    candidates=chunks,
+    format_fn=lambda chunk: chunk.content,
+)
+print([candidate.probability for candidate in output.scored])
+```
+
+Methods, parameters and backend notes (OpenAI `logit_bias`, vLLM
+`allowed_token_ids`) are documented in
+[`../../ragu/decision/README.md`](../../ragu/decision/README.md).
+
 ---
 
 ### Prompt Tuning

@@ -287,3 +287,53 @@ Dependency answers:
 {% endfor %}
 Rewrite the subquery and return the result as valid JSON matching the provided schema.
 """
+
+DEFAULT_DECISION_SYSTEM_PROMPT = """
+You are a precise decision model inside a retrieval system. You never explain
+or generate text: you answer with exactly one of the allowed option labels.
+"""
+
+DEFAULT_DECISION_CHOICE_PROMPT = """
+{%- if context %}
+Context:
+{{ context }}
+
+{% endif -%}
+Question: {{ question }}
+
+Options:
+{{ options_block }}
+
+Answer with a single label ({{ labels }}):
+"""
+
+DEFAULT_DECISION_POINTWISE_PROMPT = """
+Query: {{ query }}
+{%- if state_context %}
+
+Facts gathered so far:
+{{ state_context }}
+{%- endif %}
+
+Candidate:
+{{ candidate }}
+
+Is this candidate directly useful for answering the query or for advancing the reasoning chain towards the answer?
+Answer Y or N:
+"""
+
+DEFAULT_DECISION_LISTWISE_PROMPT = """
+Query: {{ query }}
+{%- if state_context %}
+
+Facts gathered so far:
+{{ state_context }}
+{%- endif %}
+
+Candidates:
+{{ candidates_block }}
+{{ none_label }}) None of the candidates is relevant.
+
+Which candidate gives the most direct factual step towards answering the query?
+Answer with a single letter ({{ first_label }}-{{ last_label }} or {{ none_label }}):
+"""

@@ -16,6 +16,9 @@ from ragu.common.global_parameters import Settings
 # Model clients
 from ragu.models import CachedAsyncOpenAI, EmbedderOpenAI, LLMOpenAI
 
+# Decision models
+from ragu.decision import BaseDecisionModel, DecisionModel
+
 # Search engines
 from ragu.search_engine import (
     LocalSearchEngine,
@@ -55,6 +58,8 @@ __all__ = [
     "CachedAsyncOpenAI",
     "EmbedderOpenAI",
     "LLMOpenAI",
+    "BaseDecisionModel",
+    "DecisionModel",
     "SimpleChunker",
     "SmartSemanticChunker",
 ]

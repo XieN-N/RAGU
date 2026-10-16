@@ -128,6 +128,9 @@ through `RaguGenerativeModule`.
 | `ragu_lm_relation_description` | `str` | `RaguLmArtifactExtractor` |
 | `query_decomposition` | `QueryPlan` | `QueryPlanEngine` |
 | `query_rewrite` | `RewriteQuery` | `QueryPlanEngine` |
+| `decision_choice` | `str` | `DecisionModel.a_decide` |
+| `decision_pointwise` | `str` | `DecisionModel.a_score_pointwise` |
+| `decision_listwise` | `str` | `DecisionModel.a_score_listwise` |
 
 ```python
 from ragu.common.prompts import DEFAULT_PROMPT_TEMPLATES

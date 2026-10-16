@@ -36,6 +36,10 @@ from ragu.common.prompts.default_templates import (
     DEFAULT_QUERY_DECOMPOSITION_PROMPT,
     DEFAULT_QUERY_REWRITE_PROMPT,
     DEFAULT_RAGU_LM_SYSTEM_PROMPT,
+    DEFAULT_DECISION_SYSTEM_PROMPT,
+    DEFAULT_DECISION_CHOICE_PROMPT,
+    DEFAULT_DECISION_POINTWISE_PROMPT,
+    DEFAULT_DECISION_LISTWISE_PROMPT,
 )
 from ragu.common.prompts.few_shot import (
     FewShotFormatter,
@@ -284,5 +288,38 @@ DEFAULT_PROMPT_TEMPLATES: dict[str, RAGUInstruction] = {
         ),
         pydantic_model=RewriteQuery,
         description="Prompt for rewriting a subquery using answers from its dependencies.",
+    ),
+
+    "decision_choice": RAGUInstruction(
+        messages=ChatMessages.from_messages(
+            [
+                SystemMessage(content=DEFAULT_DECISION_SYSTEM_PROMPT),
+                UserMessage(content=DEFAULT_DECISION_CHOICE_PROMPT),
+            ]
+        ),
+        pydantic_model=str,
+        description="Single-token choice of one labelled option (decision model).",
+    ),
+
+    "decision_pointwise": RAGUInstruction(
+        messages=ChatMessages.from_messages(
+            [
+                SystemMessage(content=DEFAULT_DECISION_SYSTEM_PROMPT),
+                UserMessage(content=DEFAULT_DECISION_POINTWISE_PROMPT),
+            ]
+        ),
+        pydantic_model=str,
+        description="Single-token Y/N relevance judgement of one candidate (decision model).",
+    ),
+
+    "decision_listwise": RAGUInstruction(
+        messages=ChatMessages.from_messages(
+            [
+                SystemMessage(content=DEFAULT_DECISION_SYSTEM_PROMPT),
+                UserMessage(content=DEFAULT_DECISION_LISTWISE_PROMPT),
+            ]
+        ),
+        pydantic_model=str,
+        description="Single-token pick of the best lettered candidate, read as a ranking from top_logprobs (decision model).",
     ),
 }

@@ -45,6 +45,7 @@ Constructor parameters:
 | `tokenizer_model` | Model or encoding name, e.g. `gpt-4o-mini`, `o200k_base`, `bond005/meno-lite-0.1` | `"gpt-4o-mini"` |
 | `top_logprobs` | First-token alternatives to request (OpenAI allows at most 20) | `20` |
 | `bias` | Logit bias for label tokens when `constraint="logit_bias"` | `100` |
+| `skip_failed_requests` | In pointwise/listwise scoring, a candidate whose request raised (e.g. a provider rejects its text) is scored 0 and marked degraded instead of failing the call; `a_decide` always raises | `False` |
 
 Token ids are collected for every label both bare and with a leading space
 (`"Y"` and `" Y"` are different BPE tokens); a label that is not a single token

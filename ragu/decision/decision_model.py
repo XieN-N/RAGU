@@ -163,6 +163,11 @@ class DecisionModel(RaguGenerativeModule, BaseDecisionModel):
     :param top_logprobs: Number of first-token alternatives to request.
     :param bias: Logit bias added to label tokens when ``constraint`` is
         ``logit_bias``.
+    :param skip_failed_requests: In :meth:`a_score_pointwise` and
+        :meth:`a_score_listwise`, score a candidate whose request raised as 0
+        (not selected, ``degraded``) instead of failing the whole call, e.g.
+        when a provider rejects one candidate's text. :meth:`a_decide` always
+        raises.
     """
 
     def __init__(
@@ -174,6 +179,7 @@ class DecisionModel(RaguGenerativeModule, BaseDecisionModel):
         tokenizer_model: str = "gpt-4o-mini",
         top_logprobs: int = MAX_TOP_LOGPROBS,
         bias: int = 100,
+        skip_failed_requests: bool = False,
     ):
         super().__init__(prompts=list(_DECISION_PROMPTS))
         if constraint not in ("none", "logit_bias", "allowed_token_ids"):
@@ -184,6 +190,7 @@ class DecisionModel(RaguGenerativeModule, BaseDecisionModel):
         self.tokenizer_model = tokenizer_model
         self.top_logprobs = top_logprobs
         self.bias = bias
+        self.skip_failed_requests = skip_failed_requests
         self._encode: Callable[[str], list[int]] | None = None
         self._token_ids_cache: dict[tuple[str, ...], list[int]] = {}
 
@@ -249,17 +256,39 @@ class DecisionModel(RaguGenerativeModule, BaseDecisionModel):
         self,
         conversations: Sequence[ChatMessages],
         labels: Sequence[str],
+        allow_failures: bool = False,
     ) -> list[tuple[dict[str, float], bool]]:
-        """Request option masses for every conversation concurrently and normalize them."""
+        """
+        Request option masses for every conversation concurrently and normalize them.
+
+        With ``allow_failures`` and ``skip_failed_requests``, a request that raises
+        yields an all-zero, degraded distribution instead of failing the batch.
+        """
         kwargs = self._request_kwargs(labels)
+        tolerate = allow_failures and self.skip_failed_requests
         masses = await asyncio.gather(*[
             self.llm.option_probabilities(
                 conversation.to_openai(), list(labels), **kwargs
             )
             for conversation in conversations
-        ])
-        results = [normalize_masses(mass, labels) for mass in masses]
-        degraded = sum(1 for _, is_degraded in results if is_degraded)
+        ], return_exceptions=tolerate)
+
+        results: list[tuple[dict[str, float], bool]] = []
+        failures: list[BaseException] = []
+        for mass in masses:
+            if isinstance(mass, BaseException):
+                if not isinstance(mass, Exception):
+                    raise mass  # cancellation and other control flow must propagate
+                failures.append(mass)
+                results.append(({label: 0.0 for label in labels}, True))
+            else:
+                results.append(normalize_masses(mass, labels))
+        if failures:
+            logger.warning(
+                f"DecisionModel: {len(failures)}/{len(results)} requests failed and were "
+                f"scored 0 (first error: {type(failures[0]).__name__}: {failures[0]})"
+            )
+        degraded = sum(1 for _, is_degraded in results if is_degraded) - len(failures)
         if degraded:
             logger.warning(
                 f"DecisionModel: {degraded}/{len(results)} requests returned none of "
@@ -320,7 +349,9 @@ class DecisionModel(RaguGenerativeModule, BaseDecisionModel):
             state_context=state_context,
             candidate=[format_fn(candidate) for candidate in candidates],
         )
-        results = await self._distributions(conversations, (YES_LABEL, NO_LABEL))
+        results = await self._distributions(
+            conversations, (YES_LABEL, NO_LABEL), allow_failures=True
+        )
 
         scored = [
             ScoredCandidate(
@@ -369,7 +400,7 @@ class DecisionModel(RaguGenerativeModule, BaseDecisionModel):
             none_label=NONE_LABEL,
         )[0]
         [(distribution, degraded)] = await self._distributions(
-            [conversation], (*labels, NONE_LABEL)
+            [conversation], (*labels, NONE_LABEL), allow_failures=True
         )
 
         none_probability = distribution[NONE_LABEL]

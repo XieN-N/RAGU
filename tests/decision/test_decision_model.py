@@ -126,6 +126,38 @@ async def test_pointwise_empty_candidates_make_no_calls() -> None:
     assert output.selected == [] and output.n_calls == 0 and llm.calls == []
 
 
+def _reject(*needles: str) -> Callable[[str, list[str]], dict[str, float]]:
+    """Raise for candidates containing a needle (like a provider content filter), else P(Y)=0.9."""
+    def script(prompt: str, options: list[str]) -> dict[str, float]:
+        if any(needle in prompt.split("Candidate:")[1] for needle in needles):
+            raise ValueError("Invalid prompt")
+        return {"Y": 0.9, "N": 0.1}
+    return script
+
+
+async def test_pointwise_failed_request_raises_by_default() -> None:
+    model = DecisionModel(ScriptedLLM(_reject("bad")))
+    with pytest.raises(ValueError, match="Invalid prompt"):
+        await model.a_score_pointwise("q", ["good", "bad"])
+
+
+async def test_pointwise_skips_failed_request_when_asked() -> None:
+    model = DecisionModel(ScriptedLLM(_reject("bad")), skip_failed_requests=True)
+    output = await model.a_score_pointwise("q", ["good", "bad", "fine"])
+    assert output.selected == ["good", "fine"]
+    failed = next(c for c in output.scored if c.item == "bad")
+    assert failed.probability == 0.0 and failed.degraded and not failed.passed_threshold
+    assert output.degraded_count == 1
+
+
+async def test_decide_still_raises_with_skip_failed_requests() -> None:
+    def boom(prompt: str, options: list[str]) -> dict[str, float]:
+        raise ValueError("Invalid prompt")
+    model = DecisionModel(ScriptedLLM(boom), skip_failed_requests=True)
+    with pytest.raises(ValueError, match="Invalid prompt"):
+        await model.a_decide("q", ["x", "y"])
+
+
 # ---------------------------------------------------------------------------
 # a_score_listwise
 # ---------------------------------------------------------------------------

@@ -7,17 +7,21 @@ from textwrap import dedent
 from typing import Any, Dict, List, Literal
 from typing_extensions import override
 
+import numpy as np
 from jinja2 import Template
 
 from ragu.chunker.types import Chunk
 from ragu.common.global_parameters import Settings
 from ragu.common.prompts.messages import ChatMessages, render
 from ragu.common.prompts.prompt_storage import RAGUInstruction
+from ragu.decision.decision_model import BaseDecisionModel
+from ragu.decision.types import DecisionOutput
 
 from ragu.graph.graph_retrieve_backend import GraphRetriever
 from ragu.graph.knowledge_graph import KnowledgeGraph
 from ragu.graph.types import Entity, Relation
-from ragu.storage.types import EmbeddingHit
+from ragu.storage.base_storage import BaseVectorStorage
+from ragu.storage.types import EmbeddingHit, Point
 
 from ragu.models.embedder import Embedder
 from ragu.models.llm import LLM
@@ -54,11 +58,38 @@ class LocalParams(EngineParams):
         context. (Generation-time; ignored by :meth:`batch_search`.)
     :param use_chunks: Whether source chunks are included in the generated
         context. (Generation-time; ignored by :meth:`batch_search`.)
+    :param selector: ``"none"`` keeps the full local context. ``"pointwise"``
+        asks the engine's decision model a ``Y``/``N`` relevance question for
+        each candidate entity, relation and chunk and keeps the ones that pass.
+        (Retrieval-time; requires ``decision_model``.) ``"cosine"`` builds the
+        same pools and keeps the ``select_top_*`` most query-similar candidates
+        of each section, without a decision model (a ranking baseline).
+    :param select_top_entities: Entities kept by the ``"cosine"`` selector.
+    :param select_top_relations: Relations kept by the ``"cosine"`` selector.
+    :param select_top_chunks: Chunks kept by the ``"cosine"`` selector.
+    :param select_pool_entities: Entities judged by the selector, in retrieval
+        order; the rest are dropped.
+    :param select_pool_relations: Relations judged by the selector, taken in
+        order of cosine similarity to the query; the rest are dropped.
+    :param select_pool_chunks: Chunks judged by the selector, taken in order of
+        cosine similarity to the query; the rest are dropped.
+    :param select_threshold: Minimum ``P(Y)`` for a candidate to be kept.
+    :param select_floor: Per section, at least this many candidates are kept
+        (best pool order first) even if fewer pass the threshold.
     """
     top_k: int = 20
     rerank_top_k: int | None = None
     use_summary: bool = False
     use_chunks: bool = True
+    selector: Literal["none", "pointwise", "cosine"] = "none"
+    select_pool_entities: int = 20
+    select_pool_relations: int = 30
+    select_pool_chunks: int = 10
+    select_threshold: float = 0.5
+    select_floor: int = 3
+    select_top_entities: int = 4
+    select_top_relations: int = 4
+    select_top_chunks: int = 3
 
 
 @dataclass(slots=True)
@@ -148,6 +179,7 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
         max_context_length: int | None = None,
         tokenizer_backend: Literal["tiktoken", "local"] | None = None,
         tokenizer_model: str | None = None,
+        decision_model: BaseDecisionModel | None = None,
     ):
         """
         Initialize a `LocalSearchEngine`.
@@ -164,6 +196,9 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
             ``None``, falls back to ``Settings.tokenizer_llm_backend``.
         :param tokenizer_model: Tokenizer model identifier for context truncation.
             When ``None``, falls back to ``Settings.tokenizer_llm_name``.
+        :param decision_model: Optional single-token decision model used when
+            ``LocalParams.selector`` is not ``"none"``. It may wrap ``llm`` or a
+            separate model.
         """
         _PROMPTS_NAMES = ["local_search"]
         super().__init__(
@@ -182,6 +217,7 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
             reranker=reranker,
         )
         self.reranker = reranker
+        self.decision_model = decision_model
         self.language = language if language else Settings.language
 
     @override
@@ -206,6 +242,11 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
             return []
 
         params = params or LocalParams()
+        if params.selector == "pointwise" and self.decision_model is None:
+            raise ValueError(
+                f"LocalParams.selector={params.selector!r} needs a decision_model "
+                f"passed to LocalSearchEngine"
+            )
         entity_results = await self.retriever.query_entities(queries, top_k=params.top_k)
 
         ranked_entities = await asyncio.gather(*[
@@ -218,11 +259,126 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
             self.knowledge_graph,
         )
 
-        return list(await asyncio.gather(*[
+        retrieved = list(await asyncio.gather(*[
             self._assemble(query, entities, entity_hits, ranked, edges_by_entity, neighbor_chunks)
             for query, (entities, entity_hits), ranked
             in zip(queries, entity_results, ranked_entities)
         ]))
+
+        if params.selector != "none":
+            select = self._select_pointwise if params.selector == "pointwise" else self._select_cosine
+            query_points = await self.retriever.build_query_vectors(queries)
+            await asyncio.gather(*[
+                select(query, point, retrieve, params)
+                for query, point, retrieve in zip(queries, query_points, retrieved)
+            ])
+        return retrieved
+
+    async def _selection_pools(
+        self,
+        query_point: Point,
+        result: LocalSearchResult,
+        params: LocalParams,
+    ) -> Dict[str, List[Any]]:
+        """
+        Candidate pools for selection: entities in retrieval order, relations and
+        chunks ordered by cosine similarity to the query, each cut to its pool size.
+        """
+        index = self.knowledge_graph.index
+        relations, chunks = await asyncio.gather(
+            _order_by_query_similarity(query_point, result.relations, index.edges_vector_db),
+            _order_by_query_similarity(query_point, result.chunks, index.chunks_vector_db),
+        )
+        return {
+            "entities": result.entities[:params.select_pool_entities],
+            "relations": relations[:params.select_pool_relations],
+            "chunks": chunks[:params.select_pool_chunks],
+        }
+
+    async def _select_cosine(
+        self,
+        query: str,
+        query_point: Point,
+        retrieve: LocalSearchRetrieve,
+        params: LocalParams,
+    ) -> None:
+        """
+        Keep the most query-similar candidates of each section, without a decision model.
+
+        Uses the same pools as :meth:`_select_pointwise`, so the two selectors
+        differ only in how candidates are chosen from them.
+
+        :param query: Input query string (unused; kept for a uniform signature).
+        :param query_point: Query vector built by the retriever.
+        :param retrieve: Assembled local context of the query.
+        :param params: Selection parameters.
+        """
+        result = retrieve.result
+        pools = await self._selection_pools(query_point, result, params)
+        result.entities = pools["entities"][:params.select_top_entities]
+        result.relations = pools["relations"][:params.select_top_relations]
+        result.chunks = pools["chunks"][:params.select_top_chunks]
+        retrieve.metrics["selection"] = {
+            name: {"pool": len(pools[name]), "kept": len(kept), "n_calls": 0}
+            for name, kept in (
+                ("entities", result.entities),
+                ("relations", result.relations),
+                ("chunks", result.chunks),
+            )
+        }
+
+    async def _select_pointwise(
+        self,
+        query: str,
+        query_point: Point,
+        retrieve: LocalSearchRetrieve,
+        params: LocalParams,
+    ) -> None:
+        """
+        Keep only the entities, relations and chunks the decision model judges useful.
+
+        Relations and chunks are first ordered by cosine similarity to the query
+        so that the judged pools hold the most similar candidates. The selection
+        replaces the sections of ``retrieve.result`` in place and is reported in
+        ``retrieve.metrics["selection"]``.
+
+        :param query: Input query string.
+        :param query_point: Query vector built by the retriever.
+        :param retrieve: Assembled local context of the query.
+        :param params: Selection parameters.
+        """
+        assert self.decision_model is not None
+        result = retrieve.result
+        pools = await self._selection_pools(query_point, result, params)
+        entity_out, relation_out, chunk_out = await asyncio.gather(
+            self.decision_model.a_score_pointwise(
+                query, pools["entities"], _format_entity, threshold=params.select_threshold,
+            ),
+            self.decision_model.a_score_pointwise(
+                query, pools["relations"], _format_relation, threshold=params.select_threshold,
+            ),
+            self.decision_model.a_score_pointwise(
+                query, pools["chunks"], _format_chunk, threshold=params.select_threshold,
+            ),
+        )
+        result.entities = _keep_with_floor(entity_out, pools["entities"], params.select_floor)
+        result.relations = _keep_with_floor(relation_out, pools["relations"], params.select_floor)
+        result.chunks = _keep_with_floor(chunk_out, pools["chunks"], params.select_floor)
+        retrieve.metrics["selection"] = {
+            name: {
+                "pool": len(pools[name]),
+                "kept": len(kept),
+                "passed": len(output.selected),
+                "n_calls": output.n_calls,
+                "degraded": output.degraded_count,
+                "probabilities": [round(c.probability, 4) for c in output.scored],
+            }
+            for name, output, kept in (
+                ("entities", entity_out, result.entities),
+                ("relations", relation_out, result.relations),
+                ("chunks", chunk_out, result.chunks),
+            )
+        }
 
     async def _rank_entities(
         self,
@@ -454,3 +610,71 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
                 delta=delta,
                 payload={},
             )
+
+
+def _format_entity(entity: Entity) -> str:
+    return f"{entity.entity_name} ({entity.entity_type}): {entity.description}"
+
+
+def _format_relation(relation: Relation) -> str:
+    return (
+        f"{relation.subject_name} --[{relation.relation_type}]--> "
+        f"{relation.object_name}: {relation.description}"
+    )
+
+
+def _format_chunk(chunk: Chunk) -> str:
+    return chunk.content
+
+
+async def _order_by_query_similarity(
+    query_point: Point,
+    items: List[Any],
+    vector_db: BaseVectorStorage,
+) -> List[Any]:
+    """
+    Sort items by cosine similarity of their stored vectors to the query.
+
+    Items without a stored vector keep their relative order after the scored ones.
+
+    :param query_point: Query vector.
+    :param items: Items with an ``id`` attribute matching ``vector_db`` ids.
+    :param vector_db: Vector storage holding the items' embeddings.
+    :return: Items, most similar first.
+    """
+    if not items or query_point.dense_embedding is None:
+        return list(items)
+    query = np.asarray(query_point.dense_embedding, dtype=np.float32)
+    query = query / (np.linalg.norm(query) or 1.0)
+    points = await vector_db.get_points_by_ids([item.id for item in items])
+    scored: List[tuple[float, int]] = []
+    missing: List[int] = []
+    for i, point in enumerate(points):
+        if point is None or point.dense_embedding is None:
+            missing.append(i)
+            continue
+        vector = np.asarray(point.dense_embedding, dtype=np.float32)
+        scored.append((float(vector @ query / (np.linalg.norm(vector) or 1.0)), i))
+    scored.sort(key=lambda pair: (-pair[0], pair[1]))
+    return [items[i] for _, i in scored] + [items[i] for i in missing]
+
+
+def _keep_with_floor(output: DecisionOutput[Any], pool: List[Any], floor: int) -> List[Any]:
+    """
+    Selected candidates, topped up from the pool order up to ``floor`` items.
+
+    :param output: Decision model output over ``pool``.
+    :param pool: Judged candidates in pool order.
+    :param floor: Minimum number of items to return (bounded by the pool size).
+    :return: Kept items, selected ones first.
+    """
+    kept = list(output.selected)
+    if len(kept) < floor:
+        chosen = {id(item) for item in kept}
+        for item in pool:
+            if len(kept) >= floor:
+                break
+            if id(item) not in chosen:
+                kept.append(item)
+                chosen.add(id(item))
+    return kept

@@ -379,6 +379,31 @@ Retrieval parameters:
 - `use_summary` and `use_chunks`: toggles for `LocalSearchEngine.query`.
 - `allow_partial_failures`: controls `MixSearchEngine` child-engine failures.
 
+Context selection in `LocalSearchEngine` (`LocalParams.selector`, default `"none"`):
+
+- Pools: the first `select_pool_entities` entities (retrieval order) and the
+  `select_pool_relations` relations and `select_pool_chunks` chunks most similar
+  to the query (cosine against their stored vectors). Defaults: 20 / 30 / 10.
+- `selector="pointwise"`: a decision model (`LocalSearchEngine(..., decision_model=...)`,
+  see [`ragu/decision/README.md`](../decision/README.md)) answers a `Y`/`N`
+  relevance question per pooled candidate; candidates with `P(Y) >= select_threshold`
+  (default `0.5`) are kept, topped up to `select_floor` (default `3`) per section
+  in pool order. One request per candidate.
+- `selector="cosine"`: no model calls; keeps the `select_top_entities` /
+  `select_top_relations` / `select_top_chunks` (defaults 4 / 4 / 3) first
+  candidates of each pool. A ranking baseline for `pointwise`.
+- Either selector reports per-section pool and kept counts in
+  `retrieve.metrics["selection"]`.
+
+```python
+from ragu.decision import DecisionModel
+from ragu.search_engine.local_search import LocalParams
+
+engine = LocalSearchEngine(llm=llm, knowledge_graph=kg, embedder=emb,
+                           decision_model=DecisionModel(llm))
+result = await engine.a_query("Who wrote 'Quo Vadis'?", LocalParams(selector="pointwise"))
+```
+
 ## Dependencies
 
 Internal:

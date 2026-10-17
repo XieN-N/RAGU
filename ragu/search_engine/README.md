@@ -388,19 +388,27 @@ Context selection in `LocalSearchEngine` (`LocalParams.selector`, default `"none
   see [`ragu/decision/README.md`](../decision/README.md)) answers a `Y`/`N`
   relevance question per pooled candidate; candidates with `P(Y) >= select_threshold`
   (default `0.5`) are kept, topped up to `select_floor` (default `3`) per section
-  in pool order. One request per candidate.
+  in pool order. One request per candidate. With a strict model the floor
+  often decides most of the context: on MuSiQue with `gpt-4o-mini` the median
+  question had 1 entity, 2 relations and 1 chunk passing, so the rest of the
+  floor came from cosine order.
 - `select_hops` (pointwise only, default `1`): with `n > 1` the selection walks
   `n - 1` more hops. The unvisited endpoints of relations that passed on the
   previous hop form the frontier; their entities, relations and chunks are pooled
   by cosine similarity to the query plus the facts kept so far, judged with those
   facts as `state_context`, and the passing ones are added to the context. A hop
   with no passing relation ends the walk; per-hop statistics go to
-  `retrieve.metrics["selection_hops"]`.
+  `retrieve.metrics["selection_hops"]`. Only relations that passed the
+  threshold extend the frontier, not those added by the floor, so when nothing
+  passes on the seed hop there is no further hop. Seed-neighbourhood items left
+  outside the pools count as seen and are not reconsidered on later hops.
 - `selector="cosine"`: no model calls; keeps the `select_top_entities` /
   `select_top_relations` / `select_top_chunks` (defaults 4 / 4 / 3) first
   candidates of each pool. A ranking baseline for `pointwise`.
 - Either selector reports per-section pool and kept counts in
-  `retrieve.metrics["selection"]`.
+  `retrieve.metrics["selection"]`. `retrieve.metrics["entities"]` still lists
+  the retrieved entities before selection; `retrieve.result` holds what goes
+  into the answer prompt.
 - `select_keep_seed_context` (pointwise only, default `False`): keep the full
   seed context, as with `selector="none"`, instead of replacing it with the
   selection. The decision model then only chooses the direction of further hops

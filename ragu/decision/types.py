@@ -17,7 +17,8 @@ class ScoredCandidate(Generic[T]):
     :param probability: Normalized probability in ``[0, 1]``: ``P(Y)`` for
         pointwise scoring, the candidate's share of the first-token
         distribution for listwise scoring.
-    :param passed_threshold: Whether the candidate passed the selection rule.
+    :param passed_threshold: Whether the candidate passed the selection rule
+        (never for a degraded candidate).
     :param degraded: ``True`` if none of the option tokens appeared in the
         returned ``top_logprobs`` and the probability is a uniform fallback.
     """

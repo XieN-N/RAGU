@@ -363,7 +363,8 @@ class DecisionModel(RaguGenerativeModule, BaseDecisionModel):
                 index=i,
                 item=candidate,
                 probability=distribution[YES_LABEL],
-                passed_threshold=distribution[YES_LABEL] >= threshold,
+                # a uniform fallback is no evidence of relevance
+                passed_threshold=not degraded and distribution[YES_LABEL] >= threshold,
                 degraded=degraded,
             )
             for i, (candidate, (distribution, degraded)) in enumerate(zip(candidates, results))
@@ -414,7 +415,7 @@ class DecisionModel(RaguGenerativeModule, BaseDecisionModel):
         )
 
         none_probability = distribution[NONE_LABEL]
-        accept = none_probability < max_none_prob
+        accept = not degraded and none_probability < max_none_prob
         scored = [
             ScoredCandidate(
                 index=i,

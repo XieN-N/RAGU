@@ -62,6 +62,9 @@ raises `ValueError`.
 
 A result is *degraded* when none of the label tokens appeared in
 `top_logprobs`; the distribution is then uniform and a warning is logged.
+Degraded candidates never pass the selection rule: in pointwise scoring a
+uniform `P(Y) = 0.5` is not counted as "yes", and a degraded listwise call
+selects nothing.
 
 ## Usage
 
@@ -97,5 +100,9 @@ route = await decision_model.a_decide(
   `max_completion_tokens` or the `LLMOpenAI` constructor kwargs.
 - Reasoning models that spend the first token on a reasoning channel are not
   supported.
+- Tested against a real API so far: `a_score_pointwise` with `gpt-4o-mini` and
+  `constraint="none"` (inside `LocalSearchEngine`, on MuSiQue). `a_decide`,
+  `a_score_listwise` and the `logit_bias` / `allowed_token_ids` constraints are
+  covered by unit tests only.
 - Prompts: `decision_choice`, `decision_pointwise`, `decision_listwise`
   (override with `update_prompt`, see `ragu/common/prompts/README.md`).

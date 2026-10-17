@@ -150,6 +150,17 @@ async def test_pointwise_skips_failed_request_when_asked() -> None:
     assert output.degraded_count == 1
 
 
+async def test_pointwise_degraded_candidate_does_not_pass() -> None:
+    # neither Y nor N in top_logprobs: the uniform 0.5 must not count as "yes"
+    def script(prompt: str, options: list[str]) -> dict[str, float]:
+        return {} if "odd" in prompt.split("Candidate:")[1] else {"Y": 0.9, "N": 0.1}
+    output = await DecisionModel(ScriptedLLM(script)).a_score_pointwise("q", ["good", "odd"])
+    assert output.selected == ["good"]
+    odd = next(c for c in output.scored if c.item == "odd")
+    assert odd.probability == pytest.approx(0.5) and odd.degraded and not odd.passed_threshold
+    assert output.degraded_count == 1
+
+
 async def test_decide_still_raises_with_skip_failed_requests() -> None:
     def boom(prompt: str, options: list[str]) -> dict[str, float]:
         raise ValueError("Invalid prompt")
@@ -177,6 +188,12 @@ async def test_listwise_none_option_rejects_everything() -> None:
     output = await DecisionModel(llm).a_score_listwise("q", ["a", "b"])
     assert output.selected == []
     assert output.none_probability == pytest.approx(0.8)
+
+
+async def test_listwise_degraded_selects_nothing() -> None:
+    llm = ScriptedLLM(lambda prompt, options: {"Q": 1.0})
+    output = await DecisionModel(llm).a_score_listwise("q", ["a", "b"])
+    assert output.selected == [] and output.degraded_count == 2
 
 
 async def test_listwise_rejects_too_many_candidates() -> None:

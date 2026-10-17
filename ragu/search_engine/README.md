@@ -401,6 +401,26 @@ Context selection in `LocalSearchEngine` (`LocalParams.selector`, default `"none
   candidates of each pool. A ranking baseline for `pointwise`.
 - Either selector reports per-section pool and kept counts in
   `retrieve.metrics["selection"]`.
+- `select_keep_seed_context` (pointwise only, default `False`): keep the full
+  seed context, as with `selector="none"`, instead of replacing it with the
+  selection. The decision model then only chooses the direction of further hops
+  (`select_hops > 1`) and the facts they append after the seed context.
+- `ppr_chunks` (default `0`) and `ppr_alpha` (default `0.5`): append the top
+  `ppr_chunks` chunks by Personalized PageRank over the entity–entity and
+  entity–chunk graph (built once per engine from the graph backend), skipping
+  chunks already in the context. Seeds are entities and endpoints of relations
+  that passed the decision model, weighted by `P(Y)`; without a pointwise
+  selection, the retrieved entities weighted by similarity. Stats go to
+  `retrieve.metrics["ppr"]`.
+
+Diagnostics written by `LocalSearchEngine`:
+
+- `retrieve.metrics["timing"]`: seconds per stage — `retrieve` (entity search
+  and context assembly), `select` (decision model, including further hops),
+  `hops` (further hops only), `ppr`, and `generate` (answer LLM call, set by
+  `batch_query`). Stages are measured per batch.
+- `retrieve.metrics["decision_usage"]`: `calls` and `prompt_chars` of all
+  decision-model requests for the query (pointwise only).
 
 ```python
 from ragu.decision import DecisionModel

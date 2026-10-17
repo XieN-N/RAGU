@@ -1,5 +1,6 @@
 # Partially based on https://github.com/gusye1234/nano-graphrag/blob/main/nano_graphrag/
 import asyncio
+import time
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -7,6 +8,7 @@ from textwrap import dedent
 from typing import Any, Dict, List, Literal
 from typing_extensions import override
 
+import networkx as nx
 import numpy as np
 from jinja2 import Template
 
@@ -76,6 +78,18 @@ class LocalParams(EngineParams):
         ends the walk. The floor applies to the seed hop only.
     :param select_state_max_chars: Maximum length of the kept-facts text used as
         ``state_context`` and in the hop query vector.
+    :param select_keep_seed_context: ``"pointwise"`` only. Keep the full seed
+        context (as with ``selector="none"``) instead of replacing it with the
+        selection; the decision model then only picks the direction of further
+        hops and the facts they add, appended after the seed context.
+    :param ppr_chunks: When ``> 0``, run Personalized PageRank over the
+        entity-entity and entity-chunk graph and append this many top-ranked
+        chunks that are not in the context yet. Seeds are the entities and
+        relation endpoints that passed the decision model (weighted by
+        ``P(Y)``); without a pointwise selection, the retrieved entities
+        weighted by similarity.
+    :param ppr_alpha: PageRank damping factor (probability of following an
+        edge rather than restarting at a seed).
     :param select_pool_entities: Entities judged by the selector, in retrieval
         order; the rest are dropped.
     :param select_pool_relations: Relations judged by the selector, taken in
@@ -101,6 +115,9 @@ class LocalParams(EngineParams):
     select_top_chunks: int = 3
     select_hops: int = 1
     select_state_max_chars: int = 2000
+    select_keep_seed_context: bool = False
+    ppr_chunks: int = 0
+    ppr_alpha: float = 0.5
 
 
 @dataclass(slots=True)
@@ -230,6 +247,8 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
         self.reranker = reranker
         self.decision_model = decision_model
         self.language = language if language else Settings.language
+        self._ppr_cache: tuple[nx.Graph, List[str]] | None = None
+        self._ppr_lock = asyncio.Lock()
 
     @override
     async def batch_search(
@@ -258,6 +277,7 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
                 f"LocalParams.selector={params.selector!r} needs a decision_model "
                 f"passed to LocalSearchEngine"
             )
+        started = time.perf_counter()
         entity_results = await self.retriever.query_entities(queries, top_k=params.top_k)
 
         ranked_entities = await asyncio.gather(*[
@@ -276,13 +296,29 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
             in zip(queries, entity_results, ranked_entities)
         ]))
 
+        timing = {"retrieve": time.perf_counter() - started}
+        seeds: List[Dict[str, float]] = [{} for _ in queries]
+
         if params.selector != "none":
+            started = time.perf_counter()
             select = self._select_pointwise if params.selector == "pointwise" else self._select_cosine
             query_points = await self.retriever.build_query_vectors(queries)
-            await asyncio.gather(*[
+            seeds = list(await asyncio.gather(*[
                 select(query, point, retrieve, params)
                 for query, point, retrieve in zip(queries, query_points, retrieved)
+            ]))
+            timing["select"] = time.perf_counter() - started
+
+        if params.ppr_chunks > 0:
+            started = time.perf_counter()
+            await asyncio.gather(*[
+                self._append_ppr_chunks(retrieve, seed, params)
+                for retrieve, seed in zip(retrieved, seeds)
             ])
+            timing["ppr"] = time.perf_counter() - started
+
+        for retrieve in retrieved:
+            retrieve.metrics.setdefault("timing", {}).update(timing)
         return retrieved
 
     async def _selection_pools(
@@ -312,7 +348,7 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
         query_point: Point,
         retrieve: LocalSearchRetrieve,
         params: LocalParams,
-    ) -> None:
+    ) -> Dict[str, float]:
         """
         Keep the most query-similar candidates of each section, without a decision model.
 
@@ -323,6 +359,7 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
         :param query_point: Query vector built by the retriever.
         :param retrieve: Assembled local context of the query.
         :param params: Selection parameters.
+        :return: PageRank seeds; empty, so PageRank falls back to similarity seeds.
         """
         result = retrieve.result
         pools = await self._selection_pools(query_point, result, params)
@@ -337,6 +374,7 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
                 ("chunks", result.chunks),
             )
         }
+        return {}
 
     async def _select_pointwise(
         self,
@@ -344,19 +382,23 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
         query_point: Point,
         retrieve: LocalSearchRetrieve,
         params: LocalParams,
-    ) -> None:
+    ) -> Dict[str, float]:
         """
         Keep only the entities, relations and chunks the decision model judges useful.
 
         Relations and chunks are first ordered by cosine similarity to the query
         so that the judged pools hold the most similar candidates. The selection
-        replaces the sections of ``retrieve.result`` in place and is reported in
-        ``retrieve.metrics["selection"]``.
+        replaces the sections of ``retrieve.result`` in place (unless
+        ``params.select_keep_seed_context``) and is reported in
+        ``retrieve.metrics["selection"]``; request volume goes to
+        ``retrieve.metrics["decision_usage"]``.
 
         :param query: Input query string.
         :param query_point: Query vector built by the retriever.
         :param retrieve: Assembled local context of the query.
         :param params: Selection parameters.
+        :return: PageRank seeds: ids of passing entities and of the endpoints of
+            passing relations, weighted by ``P(Y)``, over all hops.
         """
         assert self.decision_model is not None
         result = retrieve.result
@@ -377,28 +419,52 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
                 query, pools["chunks"], _format_chunk, threshold=params.select_threshold,
             ),
         )
-        result.entities = _keep_with_floor(entity_out, pools["entities"], params.select_floor)
-        result.relations = _keep_with_floor(relation_out, pools["relations"], params.select_floor)
-        result.chunks = _keep_with_floor(chunk_out, pools["chunks"], params.select_floor)
+        # The kept facts: what the decision model accepted. They seed PageRank and
+        # form the state for further hops when the seed context is kept whole.
+        kept = LocalSearchResult(
+            entities=list(entity_out.selected),
+            relations=list(relation_out.selected),
+            chunks=list(chunk_out.selected),
+        )
+        if not params.select_keep_seed_context:
+            result.entities = _keep_with_floor(entity_out, pools["entities"], params.select_floor)
+            result.relations = _keep_with_floor(relation_out, pools["relations"], params.select_floor)
+            result.chunks = _keep_with_floor(chunk_out, pools["chunks"], params.select_floor)
         retrieve.metrics["selection"] = {
             name: {
                 "pool": len(pools[name]),
-                "kept": len(kept),
+                "kept": len(section),
                 "passed": len(output.selected),
                 "n_calls": output.n_calls,
                 "degraded": output.degraded_count,
                 "probabilities": [round(c.probability, 4) for c in output.scored],
             }
-            for name, output, kept in (
+            for name, output, section in (
                 ("entities", entity_out, result.entities),
                 ("relations", relation_out, result.relations),
                 ("chunks", chunk_out, result.chunks),
             )
         }
+        outputs = [entity_out, relation_out, chunk_out]
+        seeds: Dict[str, float] = {}
+        _add_seeds(seeds, entity_out, relation_out)
+
         if params.select_hops > 1:
-            await self._select_further_hops(
+            started = time.perf_counter()
+            # Replace mode keeps the historical state (the selection incl. floor
+            # items); keep mode must not feed the whole seed context as state.
+            state_source = kept if params.select_keep_seed_context else result
+            outputs += await self._select_further_hops(
                 query, retrieve, params, list(relation_out.selected), seen_ids,
+                state_source, seeds,
             )
+            retrieve.metrics.setdefault("timing", {})["hops"] = time.perf_counter() - started
+
+        retrieve.metrics["decision_usage"] = {
+            "calls": sum(o.n_calls for o in outputs),
+            "prompt_chars": sum(o.prompt_chars for o in outputs),
+        }
+        return seeds
 
     async def _select_further_hops(
         self,
@@ -407,7 +473,9 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
         params: LocalParams,
         passed_relations: List[Relation],
         seen_ids: set[str],
-    ) -> None:
+        state_source: LocalSearchResult,
+        seeds: Dict[str, float],
+    ) -> List[DecisionOutput[Any]]:
         """
         Walk ``params.select_hops - 1`` hops beyond the seeds, guided by the decision model.
 
@@ -415,7 +483,8 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
         passed on the previous hop. Its entities, incident relations and source
         chunks (all unseen so far) are pooled by cosine similarity to the query
         plus the kept facts and judged with those facts as ``state_context``.
-        Passing items are appended to ``retrieve.result``; per-hop statistics go to
+        Passing items are appended to ``retrieve.result`` (and to ``state_source``
+        when it is a separate view); per-hop statistics go to
         ``retrieve.metrics["selection_hops"]``.
 
         :param query: Input query string.
@@ -423,6 +492,9 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
         :param params: Selection parameters.
         :param passed_relations: Seed-hop relations that passed the threshold.
         :param seen_ids: Ids of every entity, relation and chunk already assembled.
+        :param state_source: Facts rendered as the decision-model state.
+        :param seeds: PageRank seeds, extended in place with passing items.
+        :return: Decision outputs of every judged section, for usage accounting.
         """
         assert self.decision_model is not None
         result = retrieve.result
@@ -431,6 +503,7 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
             e_id for e_id in seen_ids if e_id.startswith("ent-")
         }
         hop_stats: List[Dict[str, Any]] = []
+        outputs: List[DecisionOutput[Any]] = []
 
         for hop in range(1, params.select_hops):
             frontier_ids = sorted(
@@ -451,13 +524,17 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
                 {c_id for e in frontier for c_id in e.source_chunk_id} - seen_ids
             )
             payloads = await index.chunks_kv_storage.get_by_ids(chunk_ids) if chunk_ids else []
-            chunks = [Chunk(**payload) for payload in payloads if payload is not None]
+            # Storage keys and content-derived Chunk ids can differ; dedupe on the latter.
+            chunks = [
+                chunk for chunk in (Chunk(**payload) for payload in payloads if payload is not None)
+                if chunk.id not in seen_ids
+            ]
             entities = [e for e in frontier if e.id not in seen_ids]
             seen_ids.update(relations)
             seen_ids.update(c.id for c in chunks)
             seen_ids.update(e.id for e in entities)
 
-            state = _state_text(result, params.select_state_max_chars)
+            state = _state_text(state_source, params.select_state_max_chars)
             [state_point] = await self.retriever.build_query_vectors([f"{query}\n{state}"])
             ordered_entities, ordered_relations, ordered_chunks = await asyncio.gather(
                 _order_by_query_similarity(state_point, entities, index.nodes_vector_db),
@@ -483,9 +560,14 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
                     threshold=params.select_threshold,
                 ),
             )
-            result.entities.extend(entity_out.selected)
-            result.relations.extend(relation_out.selected)
-            result.chunks.extend(chunk_out.selected)
+            outputs += [entity_out, relation_out, chunk_out]
+            _add_seeds(seeds, entity_out, relation_out)
+            for section, output in (
+                ("entities", entity_out), ("relations", relation_out), ("chunks", chunk_out),
+            ):
+                getattr(result, section).extend(output.selected)
+                if state_source is not result:
+                    getattr(state_source, section).extend(output.selected)
             hop_stats.append({
                 "hop": hop,
                 "frontier": len(frontier),
@@ -508,6 +590,84 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
             if not passed_relations:
                 break
         retrieve.metrics["selection_hops"] = hop_stats
+        return outputs
+
+    async def _ppr_graph(self) -> tuple[nx.Graph, List[str]]:
+        """
+        Undirected entity-entity and entity-chunk graph for PageRank, built once.
+
+        Entity-entity edge weight is the number of relations between the pair;
+        every entity links to each of its source chunks with weight 1.
+
+        :return: The graph and its chunk node ids.
+        """
+        async with self._ppr_lock:
+            if self._ppr_cache is None:
+                index = self.knowledge_graph.index
+                graph = nx.Graph()
+                for entity in await index.graph_backend.get_all_nodes():
+                    graph.add_node(entity.id)
+                    for chunk_id in getattr(entity, "source_chunk_id", None) or []:
+                        graph.add_edge(entity.id, chunk_id, weight=1.0)
+                for edge in await index.graph_backend.get_all_edges():
+                    if graph.has_edge(edge.subject_id, edge.object_id):
+                        graph[edge.subject_id][edge.object_id]["weight"] += 1.0
+                    else:
+                        graph.add_edge(edge.subject_id, edge.object_id, weight=1.0)
+                chunk_nodes = [n for n in graph.nodes if str(n).startswith("chunk-")]
+                self._ppr_cache = (graph, chunk_nodes)
+            return self._ppr_cache
+
+    async def _append_ppr_chunks(
+        self,
+        retrieve: LocalSearchRetrieve,
+        seeds: Dict[str, float],
+        params: LocalParams,
+    ) -> None:
+        """
+        Append the top Personalized PageRank chunks not yet in the context.
+
+        :param retrieve: Context to extend in place; stats go to ``metrics["ppr"]``.
+        :param seeds: Node id -> restart weight. When empty, the retrieved entities
+            weighted by their similarity are used.
+        :param params: ``ppr_chunks`` and ``ppr_alpha``.
+        """
+        graph, chunk_nodes = await self._ppr_graph()
+        seeded_by = "decision_model"
+        if not seeds:
+            seeded_by = "similarity"
+            seeds = {
+                entry["id"]: float(entry["relevance_score"] or 0.0)
+                for entry in retrieve.metrics.get("entities", [])
+            }
+        personalization = {node: w for node, w in seeds.items() if w > 0 and node in graph}
+        if not personalization:
+            retrieve.metrics["ppr"] = {"seeds": 0, "added": 0, "seeded_by": seeded_by}
+            return
+        scores = await asyncio.to_thread(
+            nx.pagerank, graph, alpha=params.ppr_alpha,
+            personalization=personalization, weight="weight", tol=1e-6,
+        )
+        present = {c.id for c in retrieve.result.chunks}
+        # Over-fetch: a graph node key may name a chunk already present under its
+        # content-derived id, so dedupe again after loading.
+        ranked = sorted(
+            (n for n in chunk_nodes if n not in present),
+            key=lambda n: -scores.get(n, 0.0),
+        )[:params.ppr_chunks + len(present)]
+        payloads = await self.knowledge_graph.index.chunks_kv_storage.get_by_ids(ranked) if ranked else []
+        added: List[Chunk] = []
+        for payload in payloads:
+            if payload is None or len(added) >= params.ppr_chunks:
+                continue
+            chunk = Chunk(**payload)
+            if chunk.id not in present:
+                present.add(chunk.id)
+                added.append(chunk)
+        retrieve.result.chunks.extend(added)
+        retrieve.metrics["ppr"] = {
+            "seeds": len(personalization), "added": len(added), "seeded_by": seeded_by,
+        }
 
     async def _rank_entities(
         self,
@@ -693,11 +853,15 @@ class LocalSearchEngine(BaseEngine[LocalParams, LocalSearchRetrieve]):
         ]
 
         instruction: RAGUInstruction = self.get_prompt("local_search")
+        started = time.perf_counter()
         answers = await self.llm.batch_chat_completion(
             conversations,
             output_schema=instruction.pydantic_model,
             desc="LocalSearch batch query",
         )
+        generate_seconds = time.perf_counter() - started
+        for context in contexts:
+            context.metrics.setdefault("timing", {})["generate"] = generate_seconds
 
         return [
             SearchEngineResponse(
@@ -799,6 +963,21 @@ async def _order_by_query_similarity(
         scored.append((float(vector @ query / (np.linalg.norm(vector) or 1.0)), i))
     scored.sort(key=lambda pair: (-pair[0], pair[1]))
     return [items[i] for _, i in scored] + [items[i] for i in missing]
+
+
+def _add_seeds(
+    seeds: Dict[str, float],
+    entity_out: DecisionOutput[Any],
+    relation_out: DecisionOutput[Any],
+) -> None:
+    """Add passing entities and passing relations' endpoints to PageRank seeds (max P(Y))."""
+    for candidate in entity_out.scored:
+        if candidate.passed_threshold:
+            seeds[candidate.item.id] = max(seeds.get(candidate.item.id, 0.0), candidate.probability)
+    for candidate in relation_out.scored:
+        if candidate.passed_threshold:
+            for node in (candidate.item.subject_id, candidate.item.object_id):
+                seeds[node] = max(seeds.get(node, 0.0), candidate.probability)
 
 
 def _keep_with_floor(output: DecisionOutput[Any], pool: List[Any], floor: int) -> List[Any]:

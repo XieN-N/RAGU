@@ -183,6 +183,60 @@ async def test_single_hop_reports_no_hop_metrics(real_kg, kg_fixture_ids) -> Non
     assert "selection_hops" not in selected.metrics
 
 
+async def test_keep_seed_context_keeps_base_and_appends_hops(real_kg) -> None:
+    _, relation, frontier_entity = await _single_seed_engine(real_kg, None)
+    plain, _, _ = await _single_seed_engine(real_kg, None)
+    full = await plain.search("query", LocalParams())
+
+    decision_model = KeywordDecisionModel([relation.description, frontier_entity.entity_name])
+    engine, _, _ = await _single_seed_engine(real_kg, decision_model)
+    selected = await engine.search("query", LocalParams(
+        selector="pointwise", select_hops=2, select_keep_seed_context=True,
+    ))
+    result = selected.result
+    n_e, n_r, n_c = len(full.result.entities), len(full.result.relations), len(full.result.chunks)
+    # the seed context is untouched and comes first
+    assert [e.id for e in result.entities[:n_e]] == [e.id for e in full.result.entities]
+    assert [r.id for r in result.relations[:n_r]] == [r.id for r in full.result.relations]
+    assert [c.id for c in result.chunks[:n_c]] == [c.id for c in full.result.chunks]
+    # the frontier entity passed on hop 1 and was appended
+    assert frontier_entity.id in {e.id for e in result.entities[n_e:]}
+    usage = selected.metrics["decision_usage"]
+    assert usage["calls"] > 0  # the test double reports no prompt size
+    assert {"retrieve", "select", "hops"} <= set(selected.metrics["timing"])
+
+
+async def test_ppr_appends_new_chunks_from_similarity_seeds(real_kg) -> None:
+    engine, _, _ = await _single_seed_engine(real_kg, None)
+    full = await engine.search("query", LocalParams())
+    with_ppr = await engine.search("query", LocalParams(ppr_chunks=5))
+    base_ids = [c.id for c in full.result.chunks]
+    ids = [c.id for c in with_ppr.result.chunks]
+    assert ids[:len(base_ids)] == base_ids
+    assert len(ids) == len(set(ids))  # no duplicates
+    ppr = with_ppr.metrics["ppr"]
+    assert ppr["seeded_by"] == "similarity" and ppr["seeds"] >= 1
+    assert ppr["added"] == len(ids) - len(base_ids) <= 5
+    assert "ppr" in with_ppr.metrics["timing"]
+
+
+async def test_ppr_uses_decision_model_seeds(real_kg) -> None:
+    _, relation, _ = await _single_seed_engine(real_kg, None)
+    engine, _, _ = await _single_seed_engine(real_kg, KeywordDecisionModel([relation.description]))
+    selected = await engine.search("query", LocalParams(
+        selector="pointwise", select_keep_seed_context=True, ppr_chunks=2,
+    ))
+    assert selected.metrics["ppr"]["seeded_by"] == "decision_model"
+
+
+async def test_query_records_generation_time(real_kg) -> None:
+    engine, _, _ = await _single_seed_engine(real_kg, None)
+    engine.llm = SimpleNamespace(batch_chat_completion=AsyncMock(return_value=["answer"]))
+    [response] = await engine.batch_query(["query"], LocalParams())
+    assert response.response == "answer"
+    assert {"retrieve", "generate"} <= set(response.retrieval.metrics["timing"])
+
+
 async def test_selector_without_decision_model_raises(real_kg, kg_fixture_ids) -> None:
     engine = await _engine_with_seeds(real_kg, kg_fixture_ids, None)
     with pytest.raises(ValueError, match="decision_model"):

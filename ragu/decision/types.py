@@ -40,11 +40,14 @@ class DecisionOutput(Generic[T]):
     :param n_calls: Number of LLM requests spent.
     :param none_probability: Listwise only: probability of the "none of the
         candidates" option.
+    :param prompt_chars: Total characters of the prompts sent (a size proxy for
+        the input tokens spent).
     """
     selected: list[T] = field(default_factory=list)
     scored: list[ScoredCandidate[T]] = field(default_factory=list)
     n_calls: int = 0
     none_probability: float | None = None
+    prompt_chars: int = 0
 
     @property
     def degraded_count(self) -> int:

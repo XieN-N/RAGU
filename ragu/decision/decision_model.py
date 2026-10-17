@@ -75,6 +75,11 @@ def shannon_entropy(distribution: dict[str, float]) -> float:
     return -sum(p * math.log(p) for p in distribution.values() if p > 0.0)
 
 
+def _prompt_chars(conversation: ChatMessages) -> int:
+    """Characters across all messages of a rendered conversation."""
+    return sum(len(message.content) for message in conversation)
+
+
 class BaseDecisionModel(ABC):
     """Interface of single-token decision models."""
 
@@ -367,7 +372,12 @@ class DecisionModel(RaguGenerativeModule, BaseDecisionModel):
         selected = [candidate.item for candidate in scored if candidate.passed_threshold]
         if top_k is not None:
             selected = selected[:top_k]
-        return DecisionOutput(selected=selected, scored=scored, n_calls=len(conversations))
+        return DecisionOutput(
+            selected=selected,
+            scored=scored,
+            n_calls=len(conversations),
+            prompt_chars=sum(_prompt_chars(c) for c in conversations),
+        )
 
     async def a_score_listwise(
         self,
@@ -422,4 +432,5 @@ class DecisionModel(RaguGenerativeModule, BaseDecisionModel):
             scored=scored,
             n_calls=1,
             none_probability=none_probability,
+            prompt_chars=_prompt_chars(conversation),
         )

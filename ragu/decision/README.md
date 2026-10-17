@@ -57,7 +57,8 @@ raises `ValueError`.
   (sums to 1), `entropy` (nats), `degraded`.
 - `DecisionOutput[T]`: `selected` (best first, cut to `top_k`), `scored`
   (`ScoredCandidate[T]` sorted by probability), `n_calls`,
-  `none_probability` (listwise), `degraded_count`.
+  `none_probability` (listwise), `prompt_chars` (characters of all prompts
+  sent, a proxy for input tokens), `degraded_count`.
 
 A result is *degraded* when none of the label tokens appeared in
 `top_logprobs`; the distribution is then uniform and a warning is logged.

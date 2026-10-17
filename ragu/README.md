@@ -29,6 +29,11 @@ ragu/
 │       ├── messages.py
 │       ├── prompt_storage.py
 │       └── README.md
+├── decision/
+│   ├── __init__.py
+│   ├── decision_model.py
+│   ├── types.py
+│   └── README.md
 ├── graph/
 │   ├── __init__.py
 │   ├── artifacts_summarizer.py
@@ -103,6 +108,10 @@ Chunking logic and chunk data types.
 
 `common/`
 Shared settings, prompt helpers, cache utilities, logging, and base classes.
+
+`decision/`
+Single-token decision model (choice, pointwise and listwise scoring), used by
+`LocalSearchEngine` for optional context selection.
 
 `graph/`
 Graph construction, summarization, indexing, and the `KnowledgeGraph` facade.

@@ -468,6 +468,21 @@ Methods, parameters and backend notes (OpenAI `logit_bias`, vLLM
 `allowed_token_ids`) are documented in
 [`../../ragu/decision/README.md`](../../ragu/decision/README.md).
 
+`LocalSearchEngine` can use a decision model to select its context. It is off
+by default (`LocalParams.selector="none"`), and local search then works exactly
+as without it. With `selector="pointwise"` and
+`LocalSearchEngine(..., decision_model=DecisionModel(llm))`, the model judges
+the entities, relations and chunks most similar to the query, and only what it
+keeps goes into the answer prompt. `select_hops=2` adds a second hop: the
+relations kept on the first hop lead to new entities, whose relations and
+chunks are judged with the facts found so far in the prompt. This helps on
+multi-hop questions, where the facts needed for the answer are not in the
+immediate neighbourhood of the retrieved entities, and makes the context much
+shorter, but costs one request per candidate. `selector="cosine"` keeps the top
+candidates by similarity without any model calls and serves as a baseline.
+Options and diagnostics are listed in
+[`../../ragu/search_engine/README.md`](../../ragu/search_engine/README.md).
+
 ---
 
 ### Prompt Tuning

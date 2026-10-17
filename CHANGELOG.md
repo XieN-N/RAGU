@@ -1,5 +1,36 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- `ragu.decision`: `DecisionModel`, a single-token decision model on top of any
+  `LLM`. `a_decide` picks one of 2–20 options, `a_score_pointwise` asks a `Y`/`N`
+  relevance question per candidate, `a_score_listwise` ranks up to 19 candidates
+  by letter in one request. Probabilities come from the first token's
+  `top_logprobs`; `constraint` restricts the output token with `logit_bias`
+  (OpenAI) or `allowed_token_ids` (vLLM). `skip_failed_requests` scores a
+  candidate whose request failed as rejected instead of failing the selection.
+  Prompts `decision_choice`, `decision_pointwise` and `decision_listwise` are in
+  the default prompt registry.
+- `CachedAsyncOpenAI.option_probabilities` (and `LLM.option_probabilities`,
+  forwarded by `LLMOpenAI`): one-token completion that returns the probability
+  mass of each given option, through the same cache, retries and rate limits.
+  The OpenAI mock server returns `logprobs`.
+- Context selection in `LocalSearchEngine`: `decision_model=` argument and
+  `LocalParams.selector` — `"pointwise"` (decision model) or `"cosine"` (ranking
+  baseline) — with pool, threshold and floor options; `select_hops` walks further
+  hops from the relations the decision model kept, `select_keep_seed_context`
+  appends them to the full seed context instead of replacing it.
+- `LocalParams.ppr_chunks` / `ppr_alpha`: append chunks ranked by Personalized
+  PageRank over the entity–entity and entity–chunk graph.
+- `LocalSearchEngine` metrics: per-stage `timing`, `decision_usage` (calls and
+  prompt size), `selection`, `selection_hops` and `ppr` statistics.
+
+### Changed
+- Nothing by default: `selector="none"`, `select_hops=1` and `ppr_chunks=0`
+  keep LocalSearch exactly as before, and no decision model is created unless
+  one is passed.
+
 ## [0.1.0] - 2026-09-08
 
 ### Added

@@ -638,7 +638,7 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
                 scored[section].append(candidate)
                 if params.log_decisions:
                     format_item = {"entities": _format_entity, "relations": _format_relation, "chunks": _format_chunk}[section]
-                    decisions.append([section, round(candidate.probability, 4), len(path), format_item(candidate.item)])
+                    decisions.append([section, candidate.probability, len(path), format_item(candidate.item)])
                 if section == "relations":
                     queue.append((candidate.probability, candidate.item, (*path, candidate.item)))
 

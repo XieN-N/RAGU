@@ -217,26 +217,26 @@ local_answer = await local_search.a_query("Who wrote Romeo and Juliet?", use_sum
 print(local_answer.response)
 ```
 
-Optionally, a decision model can select the local context instead of passing
-all of it to the answer prompt: a small LLM answers yes/no with a single token
-for each pooled entity, relation and chunk, and with `select_hops > 1` it walks
-further hops from the relations it kept. It is off by default
-(`selector="none"`); without it LocalSearch behaves as above. On MuSiQue,
-`select_hops=2` with a 30-chunk pool raised answer correctness by 3.6 points
-while cutting the context from ~6k to ~1k tokens, at the cost of ~100 one-token
-requests per question.
+#### Decision search
+
+Same neighbourhood as local search, but a decision model chooses what goes into
+the answer prompt: a small LLM answers yes/no with a single token for each pooled
+entity, relation and chunk, and with `select_hops > 1` it walks further hops from
+the relations it kept. On MuSiQue, `select_hops=2` with a 30-chunk pool raised
+answer correctness by 3.6 points while cutting the context from ~6k to ~1k tokens,
+at the cost of ~100 one-token requests per question.
 
 ```python
-from ragu import DecisionModel, LocalSearchEngine
-from ragu.search_engine.local_search import LocalParams
+from ragu import DecisionModel, DecisionSearchEngine
+from ragu.search_engine.decision_search import DecisionParams
 
-local_search = LocalSearchEngine(llm=llm, knowledge_graph=knowledge_graph, embedder=embedder,
-                                 decision_model=DecisionModel(llm))
-params = LocalParams(selector="pointwise", select_hops=2, select_pool_chunks=30)
-local_answer = await local_search.a_query("Who wrote Romeo and Juliet?", params)
+decision_search = DecisionSearchEngine(llm=llm, knowledge_graph=knowledge_graph, embedder=embedder,
+                                       decision_model=DecisionModel(llm))
+params = DecisionParams(select_hops=2, select_pool_chunks=30)
+decision_answer = await decision_search.a_query("Who wrote Romeo and Juliet?", params)
 ```
 
-Selection options and diagnostics are listed in
+Options and diagnostics are listed in
 [`ragu/search_engine/README.md`](ragu/search_engine/README.md), the decision model
 itself in [`ragu/decision/README.md`](ragu/decision/README.md).
 

@@ -57,6 +57,7 @@ ragu/
 ├── search_engine/
 │   ├── __init__.py
 │   ├── base_engine.py
+│   ├── decision_search.py
 │   ├── global_search.py
 │   ├── local_search.py
 │   ├── mix_search.py
@@ -111,7 +112,7 @@ Shared settings, prompt helpers, cache utilities, logging, and base classes.
 
 `decision/`
 Single-token decision model (choice, pointwise and listwise scoring), used by
-`LocalSearchEngine` for optional context selection.
+`DecisionSearchEngine` to choose the context.
 
 `graph/`
 Graph construction, summarization, indexing, and the `KnowledgeGraph` facade.

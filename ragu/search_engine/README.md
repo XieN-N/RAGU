@@ -12,7 +12,7 @@ KnowledgeGraph + query -> retrieval context -> LLM answer
 
 ## Overview
 
-The module separates retrieval strategy from indexing. All engines share `BaseEngine`, the async `search()` for retrieval-only calls, the async `query()` for retrieval plus complete answer generation, and `stream_query()` for retrieval plus streamed text generation where supported. For many queries at once, every engine also exposes async `batch_search()` / `batch_query()`, which run retrieval concurrently and — for the leaf engines (Local, Naive, Global) — route answer generation through a single `llm.batch_chat_completion` call. `search()`, `query()`, `batch_search()`, and `batch_query()` are coroutines (await them); `stream_query()` returns an async iterator. The `a_search` / `a_query` names are kept as backward-compatible async aliases that delegate to `search` / `query`.
+The module separates retrieval strategy from indexing. All engines share `BaseEngine`, the async `search()` for retrieval-only calls, the async `query()` for retrieval plus complete answer generation, and `stream_query()` for retrieval plus streamed text generation where supported. For many queries at once, every engine also exposes async `batch_search()` / `batch_query()`, which run retrieval concurrently and — for the leaf engines (Local, Decision, Naive, Global) — route answer generation through a single `llm.batch_chat_completion` call. `search()`, `query()`, `batch_search()`, and `batch_query()` are coroutines (await them); `stream_query()` returns an async iterator. The `a_search` / `a_query` names are kept as backward-compatible async aliases that delegate to `search` / `query`.
 
 ## Key Components
 
@@ -131,6 +131,37 @@ graph = KnowledgeGraph(llm=llm, embedder=embedder)
 engine = LocalSearchEngine(llm=llm, knowledge_graph=graph, embedder=embedder)
 
 print(engine.language)
+```
+
+### DecisionSearchEngine
+
+Graph-neighborhood RAG in which a decision model chooses the context.
+
+- Purpose: start from the neighbourhood `LocalSearchEngine` would retrieve, keep what a
+  single-token decision model (see [`ragu/decision/README.md`](../decision/README.md))
+  accepts, and optionally walk further hops from the relations it kept.
+- Best for: multi-hop questions, and whenever a shorter context matters more than
+  one extra request per candidate.
+- Requires: `decision_model`, which has no default; without one use `LocalSearchEngine`.
+- Works under `QueryPlanEngine` and `MixSearchEngine` like any other engine. The answer
+  prompt is `local_search`.
+
+```python
+from ragu import DecisionModel, DecisionSearchEngine, KnowledgeGraph
+from ragu.models.embedder import EmbedderOpenAI
+from ragu.models.llm import LLMOpenAI
+from ragu.models.openai import CachedAsyncOpenAI
+from ragu.search_engine.decision_search import DecisionParams
+
+client = CachedAsyncOpenAI(base_url="https://api.openai.com/v1", api_key="dummy-api-token")
+llm = LLMOpenAI(client=client, model_name="gpt-4o-mini")
+embedder = EmbedderOpenAI(client=client, model_name="text-embedding-3-small", dim=1536)
+graph = KnowledgeGraph(llm=llm, embedder=embedder)
+engine = DecisionSearchEngine(llm=llm, knowledge_graph=graph, embedder=embedder,
+                              decision_model=DecisionModel(llm))
+params = DecisionParams(select_hops=2, select_pool_chunks=30)
+
+print(params.policy)
 ```
 
 ### GlobalSearchEngine
@@ -376,68 +407,67 @@ Retrieval parameters:
 
 - `top_k`: initial result count for local and naive search.
 - `rerank_top_k`: final chunk count for `NaiveSearchEngine` when a reranker is configured.
-- `use_summary` and `use_chunks`: toggles for `LocalSearchEngine.query`.
+- `use_summary` and `use_chunks`: toggles for `LocalSearchEngine.query` and `DecisionSearchEngine.query`.
 - `allow_partial_failures`: controls `MixSearchEngine` child-engine failures.
 
-Context selection in `LocalSearchEngine` (`LocalParams.selector`, default `"none"`):
+Stage timings written by `LocalSearchEngine`: `retrieve.metrics["timing"]` holds
+seconds per stage: `retrieve` (entity search and context assembly) and `generate`
+(answer LLM call, set by `batch_query`). Stages are measured per batch.
+
+Parameters of `DecisionSearchEngine` (`DecisionParams`) repeat `top_k`, `rerank_top_k`,
+`use_summary` and `use_chunks`, and add the walk described below.
 
 - Pools: the first `select_pool_entities` entities (retrieval order) and the
   `select_pool_relations` relations and `select_pool_chunks` chunks most similar
   to the query (cosine against their stored vectors). Defaults: 20 / 30 / 10.
-- `selector="pointwise"`: a decision model (`LocalSearchEngine(..., decision_model=...)`,
-  see [`ragu/decision/README.md`](../decision/README.md)) answers a `Y`/`N`
-  relevance question per pooled candidate; candidates with `P(Y) >= select_threshold`
-  (default `0.5`) are kept, topped up to `select_floor` (default `3`) per section
-  in pool order. One request per candidate. With a strict model the floor
-  often decides most of the context: on MuSiQue with `gpt-4o-mini` the median
-  question had 1 entity, 2 relations and 1 chunk passing, so the rest of the
-  floor came from cosine order.
-- `select_hops` (pointwise only, default `1`): with `n > 1` the selection walks
-  `n - 1` more hops. The unvisited endpoints of relations that passed on the
-  previous hop form the frontier; their entities, relations and chunks are pooled
-  by cosine similarity to the query plus the facts kept so far, judged with those
-  facts as `state_context`, and the passing ones are added to the context. A hop
-  with no passing relation ends the walk; per-hop statistics go to
-  `retrieve.metrics["selection_hops"]`. Only relations that passed the
-  threshold extend the frontier, not those added by the floor, so when nothing
-  passes on the seed hop there is no further hop. Seed-neighbourhood items left
-  outside the pools count as seen and are not reconsidered on later hops.
-- `selector="cosine"`: no model calls; keeps the `select_top_entities` /
-  `select_top_relations` / `select_top_chunks` (defaults 4 / 4 / 3) first
-  candidates of each pool. A ranking baseline for `pointwise`.
-- Either selector reports per-section pool and kept counts in
-  `retrieve.metrics["selection"]`. `retrieve.metrics["entities"]` still lists
-  the retrieved entities before selection; `retrieve.result` holds what goes
-  into the answer prompt.
-- `select_keep_seed_context` (pointwise only, default `False`): keep the full
-  seed context, as with `selector="none"`, instead of replacing it with the
-  selection. The decision model then only chooses the direction of further hops
-  (`select_hops > 1`) and the facts they append after the seed context.
-- `ppr_chunks` (default `0`) and `ppr_alpha` (default `0.5`): append the top
-  `ppr_chunks` chunks by Personalized PageRank over the entity–entity and
-  entity–chunk graph (built once per engine from the graph backend), skipping
-  chunks already in the context. Seeds are entities and endpoints of relations
-  that passed the decision model, weighted by `P(Y)`; without a pointwise
-  selection, the retrieved entities weighted by similarity. Stats go to
-  `retrieve.metrics["ppr"]`.
+- Judgement: the decision model answers a `Y`/`N` relevance question per pooled
+  candidate; candidates with `P(Y) >= select_threshold` (default `0.5`) are kept,
+  topped up to `select_floor` (default `3`) per section in pool order. One request
+  per candidate. With a strict model the floor often decides most of the context:
+  on MuSiQue with `gpt-4o-mini` the median question had 1 entity, 2 relations and
+  1 chunk passing, so the rest of the floor came from cosine order.
+- `select_hops` (default `1`): with `n > 1` the selection walks `n - 1` more hops.
+  The unvisited endpoints of relations that passed on the previous hop form the
+  frontier; their entities, relations and chunks are pooled by cosine similarity to
+  the query plus the facts kept so far, judged with those facts as `state_context`,
+  and the passing ones are added to the context. A hop with no passing relation ends
+  the walk. Only relations that passed the threshold extend the frontier, not those
+  added by the floor, so when nothing passes on the seed hop there is no further
+  hop. Seed-neighbourhood items left outside the pools count as seen and are not
+  reconsidered on later hops.
+- `select_state_max_chars` (default `2000`): maximum length of the kept-facts text
+  used as `state_context` and in the hop query vector.
+- `select_keep_seed_context` (default `False`): keep the full seed context instead
+  of replacing it with the selection. The decision model then only chooses the
+  direction of further hops (`select_hops > 1`) and the facts they append after the
+  seed context.
 
-Diagnostics written by `LocalSearchEngine`:
+Strategy options declare what the engine is going to support. Only the first value
+of each is implemented; the others, and any budget, raise `NotImplementedError`:
 
-- `retrieve.metrics["timing"]`: seconds per stage — `retrieve` (entity search
-  and context assembly), `select` (decision model, including further hops),
-  `hops` (further hops only), `ppr`, and `generate` (answer LLM call, set by
-  `batch_query`). Stages are measured per batch.
+| Option | Values |
+|---|---|
+| `seeds` | `entities`, `entities+facts`, `entities+facts+names` |
+| `prerank` | `cosine`, `cross_encoder` |
+| `policy` | `threshold`, `one_round`, `best_first` |
+| `state` | `facts`, `chain` |
+| `next_query` | `blob`, `subquestion` |
+| `stop` | `hops`, `budget`, `sufficient` |
+| `context_order` | `sections`, `chain` |
+| `max_context_tokens`, `max_decisions`, `min_probability` | budgets, `None` |
+
+Diagnostics written by `DecisionSearchEngine`:
+
+- `retrieve.metrics["entities"]`: the retrieved entities before selection;
+  `retrieve.result` holds what goes into the answer prompt.
+- `retrieve.metrics["selection"]`: per-section pool, kept and passed counts, requests,
+  degraded answers and probabilities of the seed hop.
+- `retrieve.metrics["selection_hops"]`: per-hop statistics when `select_hops > 1`.
 - `retrieve.metrics["decision_usage"]`: `calls` and `prompt_chars` of all
-  decision-model requests for the query (pointwise only).
-
-```python
-from ragu.decision import DecisionModel
-from ragu.search_engine.local_search import LocalParams
-
-engine = LocalSearchEngine(llm=llm, knowledge_graph=kg, embedder=emb,
-                           decision_model=DecisionModel(llm))
-result = await engine.a_query("Who wrote 'Quo Vadis'?", LocalParams(selector="pointwise"))
-```
+  decision-model requests for the query.
+- `retrieve.metrics["timing"]`: seconds per stage: `retrieve`, `select` (decision
+  model, including further hops), `hops` (further hops only) and `generate` (answer
+  LLM call, set by `batch_query`). Stages are measured per batch.
 
 ## Dependencies
 
@@ -447,6 +477,7 @@ Internal:
 - `ragu.graph.GraphRetriever`
 - `ragu.models`
 - `ragu.common.prompts`
+- `ragu.decision`
 - `ragu.utils.token_truncation`
 
 External:
@@ -458,7 +489,7 @@ External:
 ## Notes / Pitfalls
 
 - `GlobalSearchEngine` needs community summaries; build with `make_community_summary=True` or call `reindex_community()`.
-- `LocalSearchEngine` starts from entity vector search, so it needs entity vectors, not just chunk vectors.
+- `LocalSearchEngine` and `DecisionSearchEngine` start from entity vector search, so they need entity vectors, not just chunk vectors.
 - `NaiveSearchEngine` works with `build_only_vector_context=True`.
 - `MixSearchEngine` requires at least one child engine.
 - `search()` is useful for debugging retrieval before involving the LLM.

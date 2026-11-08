@@ -22,6 +22,7 @@ from ragu.decision import BaseDecisionModel, DecisionModel
 # Search engines
 from ragu.search_engine import (
     LocalSearchEngine,
+    DecisionSearchEngine,
     GlobalSearchEngine,
     MixSearchEngine,
     NaiveSearchEngine,
@@ -45,6 +46,7 @@ __all__ = [
     "GraphRetriever",
     "StorageArguments",
     "LocalSearchEngine",
+    "DecisionSearchEngine",
     "GlobalSearchEngine",
     "MixSearchEngine",
     "NaiveSearchEngine",

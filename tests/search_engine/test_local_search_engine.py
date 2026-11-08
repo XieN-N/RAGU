@@ -233,3 +233,22 @@ async def test_find_text_units_fetches_chunks_in_a_single_batched_call():
 
     # Output and seed-entity ordering preserved.
     assert [c.content for c in chunks] == ["A", "B", "C"]
+
+
+async def test_local_search_records_stage_timings(real_kg, kg_fixture_ids):
+    seeds = [e for e in await real_kg.index.get_nodes(kg_fixture_ids["entity_ids"][:2]) if e]
+    engine = LocalSearchEngine(
+        llm=SimpleNamespace(batch_chat_completion=AsyncMock(return_value=["answer"])),
+        knowledge_graph=real_kg,
+        embedder=_make_embedder_mock(),
+    )
+    engine.retriever.query_entities = AsyncMock(return_value=[(
+        seeds,
+        [EmbeddingHit(id=e.id, distance=1.0) for e in seeds],
+    )])
+
+    retrieval = await engine.search("query")
+    assert set(retrieval.metrics["timing"]) == {"retrieve"}
+
+    [response] = await engine.batch_query(["query"])
+    assert set(response.retrieval.metrics["timing"]) == {"retrieve", "generate"}

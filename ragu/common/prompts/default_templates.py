@@ -322,6 +322,19 @@ Is this candidate directly useful for answering the query or for advancing the r
 Answer Y or N:
 """
 
+DEFAULT_DECISION_NEXT_QUERY_PROMPT = """
+Query: {{ query }}
+{%- if facts %}
+
+Facts gathered so far:
+{{ facts }}
+{%- endif %}
+
+The query may need several steps. Write the one factual question to look up next to get
+closer to the answer, using the names found in the facts instead of descriptions.
+Output only the question:
+"""
+
 DEFAULT_DECISION_LISTWISE_PROMPT = """
 Query: {{ query }}
 {%- if state_context %}

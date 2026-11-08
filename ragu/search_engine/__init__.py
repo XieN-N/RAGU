@@ -3,6 +3,11 @@ from ragu.search_engine.global_search import (
     GlobalSearchRetrieve
 )
 from ragu.search_engine.base_engine import SearchEngineStreamEvent
+from ragu.search_engine.decision_search import (
+    DecisionParams,
+    DecisionSearchEngine,
+    DecisionSearchRetrieve
+)
 from ragu.search_engine.local_search import (
     LocalSearchEngine,
     LocalSearchRetrieve

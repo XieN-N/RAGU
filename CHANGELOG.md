@@ -16,20 +16,19 @@
   forwarded by `LLMOpenAI`): one-token completion that returns the probability
   mass of each given option, through the same cache, retries and rate limits.
   The OpenAI mock server returns `logprobs`.
-- Context selection in `LocalSearchEngine`: `decision_model=` argument and
-  `LocalParams.selector` — `"pointwise"` (decision model) or `"cosine"` (ranking
-  baseline) — with pool, threshold and floor options; `select_hops` walks further
-  hops from the relations the decision model kept, `select_keep_seed_context`
-  appends them to the full seed context instead of replacing it.
-- `LocalParams.ppr_chunks` / `ppr_alpha`: append chunks ranked by Personalized
-  PageRank over the entity–entity and entity–chunk graph.
-- `LocalSearchEngine` metrics: per-stage `timing`, `decision_usage` (calls and
-  prompt size), `selection`, `selection_hops` and `ppr` statistics.
+- `DecisionSearchEngine` (`ragu.search_engine.decision_search`): graph search in
+  which a decision model chooses the context. `decision_model` is mandatory.
+  `DecisionParams` holds pool, threshold and floor options; `select_hops` walks
+  further hops from the relations the decision model kept,
+  `select_keep_seed_context` appends them to the full seed context instead of
+  replacing it. Only `policy="threshold"` is implemented; the other declared
+  strategy values and budgets raise `NotImplementedError`. Metrics: `selection`,
+  `selection_hops`, `decision_usage` and per-stage `timing`.
+- `LocalSearchEngine` metrics: per-stage `timing`.
 
 ### Changed
-- Nothing by default: `selector="none"`, `select_hops=1` and `ppr_chunks=0`
-  keep LocalSearch exactly as before, and no decision model is created unless
-  one is passed.
+- Nothing by default: `LocalSearchEngine` behaves as before and makes no
+  decision-model calls.
 
 ## [0.1.0] - 2026-09-08
 

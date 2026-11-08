@@ -38,6 +38,7 @@ from ragu.common.prompts.default_templates import (
     DEFAULT_RAGU_LM_SYSTEM_PROMPT,
     DEFAULT_DECISION_SYSTEM_PROMPT,
     DEFAULT_DECISION_CHOICE_PROMPT,
+    DEFAULT_DECISION_NEXT_QUERY_PROMPT,
     DEFAULT_DECISION_POINTWISE_PROMPT,
     DEFAULT_DECISION_LISTWISE_PROMPT,
 )
@@ -299,6 +300,16 @@ DEFAULT_PROMPT_TEMPLATES: dict[str, RAGUInstruction] = {
         ),
         pydantic_model=str,
         description="Single-token choice of one labelled option (decision model).",
+    ),
+
+    "decision_next_query": RAGUInstruction(
+        messages=ChatMessages.from_messages(
+            [
+                UserMessage(content=DEFAULT_DECISION_NEXT_QUERY_PROMPT),
+            ]
+        ),
+        pydantic_model=str,
+        description="Next factual question to look up during a decision-model graph walk.",
     ),
 
     "decision_pointwise": RAGUInstruction(

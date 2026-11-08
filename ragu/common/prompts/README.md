@@ -117,7 +117,7 @@ through `RaguGenerativeModule`.
 | `relation_summarizer` | `RelationDescriptionModel` | `RelationSummarizer` |
 | `global_search_context` | `GlobalSearchContextModel` | `GlobalSearchEngine` |
 | `global_search` | `str` | `GlobalSearchEngine` |
-| `local_search` | `str` | `LocalSearchEngine` |
+| `local_search` | `str` | `LocalSearchEngine`, `DecisionSearchEngine` |
 | `naive_search` | `str` | `NaiveSearchEngine` |
 | `mix_search` | `str` | `MixSearchEngine` |
 | `mix_search_context` | `str` | `MixSearchEngine` |

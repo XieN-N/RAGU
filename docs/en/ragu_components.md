@@ -480,6 +480,13 @@ candidate. `LocalSearchEngine` makes no decision-model calls. Options and
 diagnostics are listed in
 [`../../ragu/search_engine/README.md`](../../ragu/search_engine/README.md).
 
+The `best_first` policy does not require a relation to pass a threshold: each round
+expands the relations with the highest P(Y) until the `max_decisions` budget (150 by
+default) runs out. With `next_query="subquestion"` the LLM writes the next question and
+the whole index is searched for it. The context is filled with the most probable
+candidates within `max_context_tokens`. All options:
+[`../../ragu/search_engine/README.md`](../../ragu/search_engine/README.md).
+
 ---
 
 ### Prompt Tuning

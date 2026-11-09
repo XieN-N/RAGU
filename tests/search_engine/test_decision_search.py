@@ -1,8 +1,12 @@
 """DecisionSearchEngine: context chosen by a decision model."""
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
+
+import asyncio
+import random
 
 import numpy as np
 import pytest
@@ -232,18 +236,6 @@ async def test_engine_requires_decision_model(real_kg) -> None:
 @pytest.mark.parametrize(
     "option,value",
     [
-        ("prerank", "cross_encoder"),
-        ("context_order", "chain"),
-    ],
-)
-def test_declared_but_unimplemented_options_raise(option, value) -> None:
-    with pytest.raises(NotImplementedError, match=option):
-        DecisionParams(**{option: value})
-
-
-@pytest.mark.parametrize(
-    "option,value",
-    [
         ("state", "chain"),
         ("next_query", "subquestion"),
         ("stop", "budget"),
@@ -262,6 +254,8 @@ def test_best_first_options_need_best_first(option, value) -> None:
 def test_unknown_option_value_raises() -> None:
     with pytest.raises(ValueError, match="policy"):
         DecisionParams(policy="beam")
+    with pytest.raises(TypeError):
+        DecisionParams(prerank="cosine")
 
 
 async def test_seed_context_equals_local_search(real_kg, kg_fixture_ids) -> None:
@@ -445,3 +439,45 @@ async def test_cosine_tie_break_orders_equal_probabilities(real_kg, kg_fixture_i
     def text(item):
         return getattr(item, "content", None) or getattr(item, "description", "")
     assert rendered.index(text(first)[:40]) <= rendered.index(text(last)[:40])
+
+
+async def _walk_with_random_delays(real_kg, kg_fixture_ids, seed: int) -> tuple[list[str], str]:
+    """One best-first walk where every storage call takes a random time."""
+    rng = random.Random(seed)
+
+    def delayed(original):
+        async def wrapper(*args, **kwargs):
+            await asyncio.sleep(rng.random() * 0.01)
+            return await original(*args, **kwargs)
+        return wrapper
+
+    index = real_kg.index
+    decision_model = KeywordDecisionModel(["a", "e", "o"])
+    # One seed: its relations lead to several new nodes, expanded in the same round.
+    engine = _decision_engine(real_kg, decision_model, await _seeds(real_kg, kg_fixture_ids, 1))
+    # An edge every expanded node has: parallel branches reach it at the same time.
+    edges = await index.graph_backend.get_all_edges_for_nodes(kg_fixture_ids["entity_ids"][:4])
+    template = next(edge for node_edges in edges for edge in node_edges if edge is not None)
+    shared = replace(template, id="shared-edge", description="an edge shared by the branches")
+    original_edges = index.graph_backend.get_all_edges_for_nodes
+
+    async def edges_with_shared(ids):
+        return [[*found, shared] for found in await original_edges(ids)]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(index, "get_nodes", delayed(index.get_nodes))
+        patch.setattr(index.graph_backend, "get_all_edges_for_nodes", delayed(edges_with_shared))
+        patch.setattr(index.chunks_kv_storage, "get_by_ids", delayed(index.chunks_kv_storage.get_by_ids))
+        selected = await engine.search("query", DecisionParams(
+            policy="best_first", stop="budget", min_probability=0.0, select_beam=3, context_order="flat",
+        ))
+    return decision_model.judged, selected.to_text()
+
+
+async def test_best_first_does_not_depend_on_timing(real_kg, kg_fixture_ids) -> None:
+    runs = [await _walk_with_random_delays(real_kg, kg_fixture_ids, seed) for seed in range(6)]
+    assert all(any("an edge shared" in text for text in judged) for judged, _ in runs)
+    for judged, _ in runs:
+        assert len(judged) == len(set(judged)), "a candidate was judged twice"
+    assert len({tuple(judged) for judged, _ in runs}) == 1
+    assert len({text for _, text in runs}) == 1

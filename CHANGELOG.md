@@ -21,8 +21,9 @@
   `DecisionParams` holds pool, threshold and floor options; `select_hops` walks
   further hops from the relations the decision model kept,
   `select_keep_seed_context` appends them to the full seed context instead of
-  replacing it. Only `policy="threshold"` is implemented; the other declared
-  strategy values and budgets raise `NotImplementedError`. Metrics: `selection`,
+  replacing it. `policy` is `threshold`, `one_round` or `best_first`; the last
+  expands the most probable relations until a budget runs out and can search by
+  a generated subquestion (`next_query="subquestion"`). Metrics: `selection`,
   `selection_hops`, `decision_usage` and per-stage `timing`.
 - `LocalSearchEngine` metrics: per-stage `timing`.
 

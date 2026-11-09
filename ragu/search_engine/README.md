@@ -442,19 +442,38 @@ Parameters of `DecisionSearchEngine` (`DecisionParams`) repeat `top_k`, `rerank_
   direction of further hops (`select_hops > 1`) and the facts they append after the
   seed context.
 
-Strategy options declare what the engine is going to support. Only the first value
-of each is implemented; the others, and any budget, raise `NotImplementedError`:
+Strategy options. A value outside the list raises `ValueError`. Options marked
+`best_first` need `policy="best_first"`.
 
-| Option | Values |
-|---|---|
-| `seeds` | `entities`, `entities+facts`, `entities+facts+names` |
-| `prerank` | `cosine`, `cross_encoder` |
-| `policy` | `threshold`, `one_round`, `best_first` |
-| `state` | `facts`, `chain` |
-| `next_query` | `blob`, `subquestion` |
-| `stop` | `hops`, `budget`, `sufficient` |
-| `context_order` | `sections`, `chain` |
-| `max_context_tokens`, `max_decisions`, `min_probability` | budgets, `None` |
+| Option | Values | Meaning |
+|---|---|---|
+| `seeds` | `entities`, `entities+facts`, `entities+facts+names` | where the walk starts: entities similar to the query, plus the most similar relations (`seed_facts`), plus entities named in the query |
+| `policy` | `threshold`, `one_round`, `best_first` | keep what passes `select_threshold` and expand it; judge the two-hop neighbourhood once; expand the most probable relations until a budget runs out |
+| `state` (`best_first`) | `facts`, `chain` | what the model is shown as gathered so far: the kept facts or the relations leading to the candidate |
+| `next_query` (`best_first`) | `blob`, `subquestion` | what further candidates are ranked against: the query plus the state, or a question the LLM writes for the next step, also searched over the whole index |
+| `stop` (`best_first`) | `hops`, `budget`, `sufficient` | when the walk ends |
+| `context_order` | `sections`, `ranked`, `chunks_first`, `flat` | how the kept items are arranged |
+| `tie_break` (`best_first`) | `none`, `cosine` | order of items with nearly equal `P(Y)`; with `cosine`, by `P(Y) + tie_weight * cosine` |
+
+`best_first` budgets: `max_decisions` (default 150), `max_context_tokens` (default 3000)
+and `min_probability` (default `select_threshold`). `select_beam` relations are expanded
+per round, chains are at most `select_max_depth` long, and every expanded relation adds
+at most `branch_pool_relations` relations and `branch_pool_chunks` chunks. The walk does
+not depend on how long storage calls take: expanded branches never judge the same
+candidate twice, and the earlier relation in the queue gets it. `log_decisions=True`
+puts every judged item into `metrics["decisions"]`.
+
+Configuration that gave the largest gain on MuSiQue:
+
+```python
+DecisionParams(
+    policy="best_first", stop="budget", next_query="subquestion", select_max_depth=3,
+    min_probability=0, max_context_tokens=3000, context_order="flat", select_pool_chunks=30,
+)
+```
+
+The engine does not change the answer prompt. A prompt that forbids abstaining or asks
+for a short reasoning is set with `update_prompt("local_search", ...)`.
 
 Diagnostics written by `DecisionSearchEngine`:
 

@@ -52,24 +52,22 @@ from ragu.search_engine.local_search import (
 )
 
 Seeds = Literal["entities", "entities+facts", "entities+facts+names"]
-Prerank = Literal["cosine", "cross_encoder"]
 Policy = Literal["threshold", "one_round", "best_first"]
 State = Literal["facts", "chain"]
 NextQuery = Literal["blob", "subquestion"]
 Stop = Literal["hops", "budget", "sufficient"]
-ContextOrder = Literal["sections", "ranked", "chunks_first", "flat", "chain"]
+ContextOrder = Literal["sections", "ranked", "chunks_first", "flat"]
 TieBreak = Literal["none", "cosine"]
 
-#: Declared strategy options and the values of each that are implemented.
-_STRATEGIES: dict[str, tuple[Any, tuple[str, ...]]] = {
-    "seeds": (Seeds, ("entities", "entities+facts", "entities+facts+names")),
-    "prerank": (Prerank, ("cosine",)),
-    "policy": (Policy, ("threshold", "one_round", "best_first")),
-    "state": (State, ("facts", "chain")),
-    "next_query": (NextQuery, ("blob", "subquestion")),
-    "stop": (Stop, ("hops", "budget", "sufficient")),
-    "context_order": (ContextOrder, ("sections", "ranked", "chunks_first", "flat")),
-    "tie_break": (TieBreak, ("none", "cosine")),
+#: Options with a fixed set of values, checked when parameters are constructed.
+_STRATEGIES: dict[str, Any] = {
+    "seeds": Seeds,
+    "policy": Policy,
+    "state": State,
+    "next_query": NextQuery,
+    "stop": Stop,
+    "context_order": ContextOrder,
+    "tie_break": TieBreak,
 }
 #: Options only ``policy="best_first"`` can honour, with their inert values.
 _BEST_FIRST_ONLY = {
@@ -95,10 +93,6 @@ class DecisionParams(EngineParams):
     """
     Parameters for :class:`DecisionSearchEngine`.
 
-    Strategy options declare where the engine is heading. Constructing the
-    parameters with a value that is not implemented yet raises
-    :class:`NotImplementedError`.
-
     :param top_k: Maximum number of entities to retrieve. (Retrieval-time.)
     :param rerank_top_k: After reranking the retrieved entities, keep only this
         many most-relevant entities before deriving relations, summaries and
@@ -112,7 +106,6 @@ class DecisionParams(EngineParams):
         (``seed_facts`` of them), their endpoints and source chunks.
         ``"entities+facts+names"`` also adds entities named in the query, with their
         relations and source chunks.
-    :param prerank: How candidates are ordered before being cut to the pool size.
     :param policy: How the walk uses the decision model's answers. ``"threshold"``
         keeps candidates with ``P(Y) >= select_threshold`` and expands the relations
         among them. ``"one_round"`` pools the two-hop neighbourhood by cosine similarity
@@ -177,7 +170,6 @@ class DecisionParams(EngineParams):
     use_summary: bool = False
     use_chunks: bool = True
     seeds: Seeds = "entities"
-    prerank: Prerank = "cosine"
     policy: Policy = "threshold"
     state: State = "facts"
     next_query: NextQuery = "blob"
@@ -205,23 +197,16 @@ class DecisionParams(EngineParams):
 
     def __post_init__(self) -> None:
         """
-        Refuse strategy options that are declared but not implemented yet.
+        Check the strategy options.
 
-        :raises ValueError: If an option has a value outside its declared choices.
-        :raises NotImplementedError: If an option has a declared value that is not
-            implemented.
-        :raises ValueError: If an option needs ``policy="best_first"``.
+        :raises ValueError: If an option has a value outside its allowed set, or
+            needs ``policy="best_first"``.
         """
-        for name, (choices, implemented) in _STRATEGIES.items():
+        for name, choices in _STRATEGIES.items():
             value = getattr(self, name)
             if value not in get_args(choices):
                 raise ValueError(
                     f"DecisionParams.{name}={value!r} is not one of {get_args(choices)}"
-                )
-            if value not in implemented:
-                raise NotImplementedError(
-                    f"DecisionParams.{name}={value!r} is not implemented yet; "
-                    f"available: {implemented}"
                 )
         if self.policy != "best_first":
             for name, inert in _BEST_FIRST_ONLY.items():
@@ -612,19 +597,9 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
         max_decisions = params.max_decisions if params.max_decisions is not None else DEFAULT_MAX_DECISIONS
         pools = await self._selection_pools(query_point, result, params)
         expanded = {e.id for e in result.entities}
-        outputs: list[DecisionOutput[Any]] = list(await asyncio.gather(
-            self.decision_model.a_score_pointwise(
-                query, pools["entities"], _format_entity, threshold=params.select_threshold,
-            ),
-            self.decision_model.a_score_pointwise(
-                query, pools["relations"], _format_relation, threshold=params.select_threshold,
-            ),
-            self.decision_model.a_score_pointwise(
-                query, pools["chunks"], _format_chunk, threshold=params.select_threshold,
-            ),
-        ))
+        outputs: list[DecisionOutput[Any]] = list(await self._score_sections(query, pools, params.select_threshold))
         judged = {item.id for section in pools.values() for item in section}
-        scored: dict[str, list[Any]] = {"entities": [], "relations": [], "chunks": []}
+        scored: dict[str, list[Any]] = {section: [] for section in _SECTIONS}
         queue: list[tuple[float, Relation, tuple[Relation, ...]]] = []
         decisions: list[list[Any]] = []
         similarity: dict[str, float] = {}
@@ -637,12 +612,11 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
                     continue
                 scored[section].append(candidate)
                 if params.log_decisions:
-                    format_item = {"entities": _format_entity, "relations": _format_relation, "chunks": _format_chunk}[section]
-                    decisions.append([section, candidate.probability, len(path), format_item(candidate.item)])
+                    decisions.append([section, candidate.probability, len(path), _FORMATTERS[section](candidate.item)])
                 if section == "relations":
                     queue.append((candidate.probability, candidate.item, (*path, candidate.item)))
 
-        for section, output in zip(("entities", "relations", "chunks"), outputs):
+        for section, output in zip(_SECTIONS, outputs):
             absorb(section, output, ())
 
         rounds = 0
@@ -665,12 +639,31 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
                 subquestion = await self._next_subquestion(query, state)
             rounds += 1
 
-            async def expand(entry: tuple[float, Relation, tuple[Relation, ...]], allowance: int) -> list[tuple[str, DecisionOutput[Any], tuple[Relation, ...]]]:
-                _, relation, path = entry
+            # Which branch gets which node or candidate must not depend on how long
+            # storage calls take: nodes are claimed before the branches start and
+            # candidates after they finish, in queue order.
+            found_by_subquestion: list[Relation] = []
+            subquestion_point: Point | None = None
+            if subquestion and any(len(path) <= params.select_max_depth for _, _, path in batch):
+                [(found_by_subquestion, _)] = await self.retriever.query_relations(
+                    [subquestion], top_k=params.branch_pool_relations,
+                )
+                [subquestion_point] = await self.retriever.build_query_vectors([subquestion])
+            frontier_of: list[list[str]] = []
+            for _, relation, path in batch:
+                claimed: list[str] = []
+                if len(path) <= params.select_max_depth:
+                    claimed = sorted({relation.subject_id, relation.object_id} - expanded)
+                    expanded.update(claimed)
+                frontier_of.append(claimed)
+
+            async def collect(
+                entry: tuple[float, Relation, tuple[Relation, ...]],
+                frontier_ids: list[str],
+            ) -> tuple[tuple[Relation, ...], str, list[Any], list[Any], list[Any]] | None:
+                _, _, path = entry
                 if len(path) > params.select_max_depth:
-                    return []
-                frontier_ids = sorted({relation.subject_id, relation.object_id} - expanded)
-                expanded.update(frontier_ids)
+                    return None
                 frontier = [e for e in await index.get_nodes(frontier_ids) if e is not None] if frontier_ids else []
                 relations: dict[str, Relation] = {}
                 chunk_ids: set[str] = set()
@@ -682,10 +675,8 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
                     }
                     chunk_ids = {c for e in frontier for c in e.source_chunk_id}
                 branch_state = _chain_text(path) if params.state == "chain" else state
-                if subquestion:
-                    [(found, _)] = await self.retriever.query_relations([subquestion], top_k=params.branch_pool_relations)
-                    relations.update({r.id: r for r in found if r.id not in judged})
-                    chunk_ids |= {c for r in found for c in r.source_chunk_id}
+                relations.update({r.id: r for r in found_by_subquestion if r.id not in judged})
+                chunk_ids |= {c for r in found_by_subquestion for c in r.source_chunk_id}
                 payloads = await index.chunks_kv_storage.get_by_ids(sorted(chunk_ids)) if chunk_ids else []
                 chunks = [
                     chunk for chunk in (Chunk(**payload) for payload in payloads if payload is not None)
@@ -693,40 +684,50 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
                 ]
                 entities = [e for e in frontier if e.id not in judged]
                 if not (entities or relations or chunks):
-                    return []
-                [point] = await self.retriever.build_query_vectors([subquestion or f"{query}\n{branch_state}"])
+                    return None
+                point = subquestion_point
+                if point is None:
+                    [point] = await self.retriever.build_query_vectors([f"{query}\n{branch_state}"])
                 ordered_relations, ordered_chunks = await asyncio.gather(
                     _order_by_query_similarity(point, list(relations.values()), index.edges_vector_db),
                     _order_by_query_similarity(point, chunks, index.chunks_vector_db),
                 )
-                entity_pool = entities[:allowance]
+                return path, branch_state, entities, ordered_relations, ordered_chunks
+
+            async def score(
+                path: tuple[Relation, ...],
+                branch_state: str,
+                branch_pools: dict[str, list[Any]],
+            ) -> list[tuple[str, DecisionOutput[Any], tuple[Relation, ...]]]:
+                branch_outputs = await self._score_sections(
+                    query, branch_pools, params.select_threshold, state_context=branch_state,
+                )
+                return [(section, output, path) for section, output in zip(_SECTIONS, branch_outputs)]
+
+            allowance_per_branch = max(1, (max_decisions - spent) // max(1, len(batch)))
+            collected = await asyncio.gather(*[collect(entry, ids) for entry, ids in zip(batch, frontier_of)])
+            scoring = []
+            for branch in collected:
+                if branch is None:
+                    continue
+                path, branch_state, entities, ordered_relations, ordered_chunks = branch
+                allowance = allowance_per_branch
+                entity_pool = [e for e in entities if e.id not in judged][:allowance]
                 allowance -= len(entity_pool)
-                relation_pool = ordered_relations[:min(params.branch_pool_relations, allowance)]
+                relation_pool = [r for r in ordered_relations if r.id not in judged][
+                    :min(params.branch_pool_relations, allowance)
+                ]
                 allowance -= len(relation_pool)
-                chunk_pool = ordered_chunks[:min(params.branch_pool_chunks, allowance)]
+                chunk_pool = [c for c in ordered_chunks if c.id not in judged][
+                    :min(params.branch_pool_chunks, allowance)
+                ]
                 for item in (*entity_pool, *relation_pool, *chunk_pool):
                     judged.add(item.id)
-                branch_outputs = await asyncio.gather(
-                    self.decision_model.a_score_pointwise(
-                        query, entity_pool, _format_entity, state_context=branch_state,
-                        threshold=params.select_threshold,
-                    ),
-                    self.decision_model.a_score_pointwise(
-                        query, relation_pool, _format_relation, state_context=branch_state,
-                        threshold=params.select_threshold,
-                    ),
-                    self.decision_model.a_score_pointwise(
-                        query, chunk_pool, _format_chunk, state_context=branch_state,
-                        threshold=params.select_threshold,
-                    ),
-                )
-                return [
-                    (section, output, path)
-                    for section, output in zip(("entities", "relations", "chunks"), branch_outputs)
-                ]
-
-            allowance = max(1, (max_decisions - spent) // max(1, len(batch)))
-            for branch in await asyncio.gather(*[expand(entry, allowance) for entry in batch]):
+                if entity_pool or relation_pool or chunk_pool:
+                    scoring.append(score(path, branch_state, {
+                        "entities": entity_pool, "relations": relation_pool, "chunks": chunk_pool,
+                    }))
+            for branch in await asyncio.gather(*scoring):
                 for section, output, path in branch:
                     outputs.append(output)
                     absorb(section, output, path)
@@ -748,6 +749,29 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
             "calls": sum(o.n_calls for o in outputs),
             "prompt_chars": sum(o.prompt_chars for o in outputs),
         }
+
+    async def _score_sections(
+        self,
+        query: str,
+        pools: dict[str, list[Any]],
+        threshold: float,
+        state_context: str = "",
+    ) -> list[DecisionOutput[Any]]:
+        """
+        Judge the entity, relation and chunk pools concurrently.
+
+        :param query: Input query string.
+        :param pools: Candidates per section.
+        :param threshold: Minimum ``P(Y)`` for a candidate to pass.
+        :param state_context: Facts gathered so far, shown to the decision model.
+        :return: One output per section, in the order of :data:`_SECTIONS`.
+        """
+        return await asyncio.gather(*[
+            self.decision_model.a_score_pointwise(
+                query, pools[section], _FORMATTERS[section], state_context=state_context, threshold=threshold,
+            )
+            for section in _SECTIONS
+        ])
 
     async def _add_similarities(
         self,
@@ -785,8 +809,7 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
         }
         missing = [item for item in todo if item.id not in vectors]
         if missing:
-            format_item = {"entities": _format_entity, "relations": _format_relation, "chunks": _format_chunk}[section]
-            embedded = await self.retriever.build_query_vectors([format_item(item) for item in missing])
+            embedded = await self.retriever.build_query_vectors([_FORMATTERS[section](item) for item in missing])
             vectors.update({item.id: point.dense_embedding for item, point in zip(missing, embedded)})
         for item_id, vector in vectors.items():
             vector = np.asarray(vector, dtype=np.float32)
@@ -811,7 +834,6 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
         result = retrieve.result
         min_probability = params.min_probability if params.min_probability is not None else params.select_threshold
         budget = params.max_context_tokens if params.max_context_tokens is not None else DEFAULT_MAX_CONTEXT_TOKENS
-        format_of = {"entities": _format_entity, "relations": _format_relation, "chunks": _format_chunk}
         weight = params.tie_weight if similarity is not None else 0.0
         cosine = similarity or {}
 
@@ -826,8 +848,8 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
         tokens = 0
         for probability, name, item in ranked:
             if probability < min_probability:
-                break
-            size = len(self.truncation.encoder.encode(format_of[name](item)))
+                continue
+            size = len(self.truncation.encoder.encode(_FORMATTERS[name](item)))
             if tokens + size > budget:
                 continue
             tokens += size
@@ -883,17 +905,7 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
             | {c.id for c in result.chunks}
         )
         pools = await self._selection_pools(query_point, result, params)
-        entity_out, relation_out, chunk_out = await asyncio.gather(
-            self.decision_model.a_score_pointwise(
-                query, pools["entities"], _format_entity, threshold=params.select_threshold,
-            ),
-            self.decision_model.a_score_pointwise(
-                query, pools["relations"], _format_relation, threshold=params.select_threshold,
-            ),
-            self.decision_model.a_score_pointwise(
-                query, pools["chunks"], _format_chunk, threshold=params.select_threshold,
-            ),
-        )
+        entity_out, relation_out, chunk_out = await self._score_sections(query, pools, params.select_threshold)
         for output in (entity_out, relation_out, chunk_out):
             _record_probabilities(result, output)
         # What the decision model accepted: the state for further hops when the
@@ -926,8 +938,8 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
 
         if params.select_hops > 1:
             started = time.perf_counter()
-            # Replace mode keeps the historical state (the selection incl. floor
-            # items); keep mode must not feed the whole seed context as state.
+            # The state is the selection, floor items included. With the seed context
+            # kept whole, only what the model accepted counts as state.
             state_source = kept if params.select_keep_seed_context else result
             outputs += await self._select_further_hops(
                 query, retrieve, params, list(relation_out.selected), seen_ids, state_source,
@@ -969,19 +981,17 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
         """
         result = retrieve.result
         index = self.knowledge_graph.index
-        visited_entities = {e.id for e in result.entities} | {
-            e_id for e_id in seen_ids if e_id.startswith("ent-")
-        }
+        visited = set(seen_ids)
         hop_stats: list[dict[str, Any]] = []
         outputs: list[DecisionOutput[Any]] = []
 
         for hop in range(1, params.select_hops):
             frontier_ids = sorted(
-                {x for r in passed_relations for x in (r.subject_id, r.object_id)} - visited_entities
+                {x for r in passed_relations for x in (r.subject_id, r.object_id)} - visited
             )
             if not frontier_ids:
                 break
-            visited_entities.update(frontier_ids)
+            visited.update(frontier_ids)
             frontier = [e for e in await index.get_nodes(frontier_ids) if e is not None]
 
             edge_lists = await index.graph_backend.get_all_edges_for_nodes([e.id for e in frontier])
@@ -1016,19 +1026,8 @@ class DecisionSearchEngine(BaseEngine[DecisionParams, DecisionSearchRetrieve]):
                 "relations": ordered_relations[:params.select_pool_relations],
                 "chunks": ordered_chunks[:params.select_pool_chunks],
             }
-            entity_out, relation_out, chunk_out = await asyncio.gather(
-                self.decision_model.a_score_pointwise(
-                    query, pools["entities"], _format_entity, state_context=state,
-                    threshold=params.select_threshold,
-                ),
-                self.decision_model.a_score_pointwise(
-                    query, pools["relations"], _format_relation, state_context=state,
-                    threshold=params.select_threshold,
-                ),
-                self.decision_model.a_score_pointwise(
-                    query, pools["chunks"], _format_chunk, state_context=state,
-                    threshold=params.select_threshold,
-                ),
+            entity_out, relation_out, chunk_out = await self._score_sections(
+                query, pools, params.select_threshold, state_context=state,
             )
             outputs += [entity_out, relation_out, chunk_out]
             for output in (entity_out, relation_out, chunk_out):
@@ -1184,6 +1183,10 @@ def _format_relation(relation: Relation) -> str:
 
 def _format_chunk(chunk: Chunk) -> str:
     return chunk.content
+
+
+_SECTIONS = ("entities", "relations", "chunks")
+_FORMATTERS = {"entities": _format_entity, "relations": _format_relation, "chunks": _format_chunk}
 
 
 def _state_text(result: DecisionSearchResult, max_chars: int) -> str:

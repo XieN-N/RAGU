@@ -476,6 +476,12 @@ print([candidate.probability for candidate in output.scored])
 model не обращается. Параметры и диагностика описаны в
 [`../../ragu/search_engine/README.md`](../../ragu/search_engine/README.md).
 
+Политика `best_first` не требует, чтобы связь прошла порог: на каждом раунде раскрываются
+связи с наибольшей P(Y), пока не исчерпан бюджет `max_decisions` (по умолчанию 150). При
+`next_query="subquestion"` LLM пишет следующий подвопрос, и по нему идёт поиск по всему
+индексу. Контекст заполняется самыми вероятными кандидатами в пределах
+`max_context_tokens`. Список опций: [`../../ragu/search_engine/README.md`](../../ragu/search_engine/README.md).
+
 ---
 
 ### Prompt tuning
